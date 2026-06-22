@@ -7,9 +7,7 @@ from .connectors.shm_connector import SharedMemoryConnector
 from .connectors.yuanrong_connector import YuanrongConnector
 
 try:
-    from vllm_omni.platforms.npu.omni_connectors.yuanrong_transfer_engine_connector import (
-        YuanrongTransferEngineConnector,
-    )
+    from .connectors.yuanrong_transfer_engine_connector import YuanrongTransferEngineConnector
 except ImportError:
     YuanrongTransferEngineConnector = None
 

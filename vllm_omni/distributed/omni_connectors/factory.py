@@ -93,11 +93,11 @@ def _create_yuanrong_connector(config: dict[str, Any]) -> OmniConnectorBase:
 
 def _create_yuanrong_transfer_engine_connector(config: dict[str, Any]) -> OmniConnectorBase:
     try:
-        from vllm_omni.platforms.npu.omni_connectors import YuanrongTransferEngineConnector
+        from .connectors.yuanrong_transfer_engine_connector import YuanrongTransferEngineConnector
     except ImportError as exc:
         raise ImportError(
-            "YuanrongTransferEngineConnector is only available in the NPU platform "
-            "environment. Install the Ascend/Yuanrong runtime dependencies before "
+            "YuanrongTransferEngineConnector is unavailable. Install the "
+            "Yuanrong runtime dependencies for the target device backend before "
             "using this connector."
         ) from exc
     return YuanrongTransferEngineConnector(config)
