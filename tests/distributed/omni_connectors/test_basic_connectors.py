@@ -195,3 +195,75 @@ def test_mooncake_connector_defaults_missing_host_to_detected_ip(monkeypatch: py
         assert connector.get_connection_info()["host"] == "10.20.30.40"
     finally:
         connector.close()
+
+
+def test_yuanrong_connector_cpu_rdma_uses_cpu_pool(monkeypatch: pytest.MonkeyPatch):
+    import vllm_omni.platforms.npu.omni_connectors.yuanrong_transfer_engine_connector as yuanrong_module
+
+    class _FakeResult:
+        def is_error(self):
+            return False
+
+        def to_string(self):
+            return "OK"
+
+    class _FakeTransferEngine:
+        def initialize(self, local_endpoint, protocol, device_name):
+            self.local_endpoint = local_endpoint
+            self.protocol = protocol
+            self.device_name = device_name
+            return _FakeResult()
+
+        def get_rpc_port(self):
+            return 34567
+
+        def register_memory(self, base_ptr, pool_size):
+            self.registered = (base_ptr, pool_size)
+            return _FakeResult()
+
+        def unregister_memory(self, base_ptr):
+            self.unregistered = base_ptr
+            return _FakeResult()
+
+        def finalize(self):
+            self.finalized = True
+            return _FakeResult()
+
+    monkeypatch.setattr(yuanrong_module, "TransferEngine", _FakeTransferEngine)
+
+    connector = yuanrong_module.YuanrongTransferEngineConnector(
+        {
+            "host": "127.0.0.1",
+            "rpc_port": "auto",
+            "zmq_port": "auto",
+            "protocol": "rdma",
+            "device_name": "auto",
+            "memory_pool_size": 4096,
+            "memory_pool_device": "auto",
+            "role": "receiver",
+        }
+    )
+    try:
+        assert connector.protocol == "rdma"
+        assert connector.device_name == "cpu:*"
+        assert connector.pool_device == "cpu"
+        assert connector.pool.device.type == "cpu"
+        assert connector.engine.protocol == "rdma"
+        assert connector.engine.device_name == "cpu:*"
+        assert connector.engine.registered[1] == 4096
+        assert connector.get_connection_info()["rpc_port"] == 34567
+    finally:
+        connector.close()
+
+
+def test_yuanrong_connector_pool_device_validation():
+    import vllm_omni.platforms.npu.omni_connectors.yuanrong_transfer_engine_connector as yuanrong_module
+
+    assert yuanrong_module._resolve_pool_device("auto", "rdma") == "cpu"
+    assert yuanrong_module._resolve_pool_device("auto", "ascend") == "npu"
+
+    with pytest.raises(ValueError, match="requires a CPU memory pool"):
+        yuanrong_module._resolve_pool_device("npu", "rdma")
+
+    with pytest.raises(ValueError, match="requires an NPU memory pool"):
+        yuanrong_module._resolve_pool_device("cpu", "ascend")

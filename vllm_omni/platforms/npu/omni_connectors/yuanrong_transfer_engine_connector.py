@@ -66,21 +66,34 @@ class QueryResponse:
 
 
 def _resolve_device_name(configured_device: Any, protocol: str) -> str:
+    protocol = str(protocol).strip().lower()
     device_name = str(expand_env_value(configured_device or "auto")).strip()
     if device_name.lower() not in AUTO_DEVICE_VALUES:
         return device_name
     if protocol.lower() in {"ascend", "hccl", "npu"}:
         return f"npu:{get_connector_local_rank()}"
+    if protocol == "rdma":
+        return "cpu:*"
     return ""
 
 
-def _resolve_pool_device(configured_device: Any) -> str:
-    pool_device = str(expand_env_value(configured_device or "npu")).strip().lower()
+def _resolve_pool_device(configured_device: Any, protocol: str) -> str:
+    protocol = str(protocol).strip().lower()
+    default_device = "cpu" if protocol == "rdma" else "npu"
+    pool_device = str(expand_env_value(configured_device or default_device)).strip().lower()
     if pool_device in AUTO_DEVICE_VALUES:
-        return "npu"
+        return default_device
+    if protocol == "rdma":
+        if pool_device == "cpu":
+            return pool_device
+        raise ValueError(
+            "YuanrongTransferEngineConnector with protocol='rdma' requires a CPU memory pool. "
+            f"Got memory_pool_device={pool_device!r}."
+        )
     if not (pool_device == "npu" or pool_device.startswith("npu:")):
         raise ValueError(
-            f"YuanrongTransferEngineConnector requires an NPU memory pool. Got memory_pool_device={pool_device!r}."
+            "YuanrongTransferEngineConnector with protocol='ascend' requires an NPU memory pool. "
+            f"Got memory_pool_device={pool_device!r}."
         )
     return pool_device
 
@@ -122,10 +135,10 @@ class YuanrongTransferEngineConnector(OmniConnectorBase):
         self.host = self._get_local_ip() if host_config.lower() in AUTO_HOST_VALUES else host_config
         self.zmq_port = self._resolve_port(config.get("zmq_port"), self.host, "zmq_port")
         self.rpc_port = self._resolve_port(config.get("rpc_port"), self.host, "rpc_port")
-        self.protocol = str(config.get("protocol", "ascend"))
+        self.protocol = str(config.get("protocol", "ascend")).strip().lower()
         self.device_name = _resolve_device_name(config.get("device_name", "auto"), self.protocol)
         self.pool_size = int(config.get("memory_pool_size", 1024**3))
-        self.pool_device = _resolve_pool_device(config.get("memory_pool_device", "npu"))
+        self.pool_device = _resolve_pool_device(config.get("memory_pool_device"), self.protocol)
         self.sender_host = config.get("sender_host")
         sender_zmq_port = config.get("sender_zmq_port")
         self.sender_zmq_port = self._resolve_optional_port(sender_zmq_port, "sender_zmq_port")
@@ -148,15 +161,19 @@ class YuanrongTransferEngineConnector(OmniConnectorBase):
             self.rpc_port = resolved_rpc_port
 
         logger.info(
-            "YuanrongTransferEngineConnector initialized at %s:%s (protocol=%s, device=%s)",
+            "YuanrongTransferEngineConnector initialized at %s:%s (protocol=%s, device=%s, pool_device=%s)",
             self.host,
             self.rpc_port,
             self.protocol,
             self.device_name,
+            self.pool_device,
         )
 
         try:
-            self.pool = torch.empty(self.pool_size, dtype=torch.uint8, device=self.pool_device)
+            if self.pool_device == "cpu":
+                self.pool = torch.empty(self.pool_size, dtype=torch.uint8)
+            else:
+                self.pool = torch.empty(self.pool_size, dtype=torch.uint8, device=self.pool_device)
             self.base_ptr = int(self.pool.data_ptr())
             self._ensure_result_ok(
                 self.engine.register_memory(self.base_ptr, self.pool_size),

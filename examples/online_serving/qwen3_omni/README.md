@@ -189,53 +189,87 @@ The `base_config:` line tells the loader to inherit everything else (stages,
 connectors, edges, platforms section) from the bundled production YAML, so
 you only need to spell out the deltas.
 
-#### 4. Multi-node deployment (cross-host transfer connector)
+#### 4. Multi-node deployment with Yuanrong CPU RDMA
 
 The bundled `qwen3_omni_moe.yaml` uses `SharedMemoryConnector` between stages,
 which only works when all stages run on the same physical host. For
-**cross-node** deployments, write a small overlay YAML that swaps in a
-network-capable connector (e.g. `MooncakeStoreConnector`) and re-points each
-stage's connector wiring at it. The connector spec carries your own server
-addresses — there is no checked-in default because every cluster is
-different.
+**cross-node** deployments over RDMA, use
+[`run_yuanrong_cpu_rdma_two_node.sh`](./run_yuanrong_cpu_rdma_two_node.sh).
 
-```yaml
-# my_qwen3_omni_multinode.yaml
-base_config: /path/to/vllm_omni/deploy/qwen3_omni_moe.yaml
+Topology:
 
-connectors:
-  mooncake_connector:
-    name: MooncakeStoreConnector
-    extra:
-      host: "127.0.0.1"
-      metadata_server: "http://YOUR_METADATA_HOST:8080/metadata"
-      master: "YOUR_MASTER_HOST:50051"
-      segment: 512000000    # 512 MB transfer segment
-      localbuf: 64000000    # 64 MB local buffer
-      proto: "tcp"
+```text
+node-a: stage 0 Thinker + OpenAI API server
+node-b: stage 1 Talker + stage 2 Code2Wav
 
-stages:
-  - stage_id: 0
-    output_connectors:
-      to_stage_1: mooncake_connector
-  - stage_id: 1
-    input_connectors:
-      from_stage_0: mooncake_connector
-    output_connectors:
-      to_stage_2: mooncake_connector
-  - stage_id: 2
-    input_connectors:
-      from_stage_1: mooncake_connector
+stage0 -> stage1: YuanrongTransferEngineConnector, protocol=rdma, CPU host pool
+stage1 -> stage2: SharedMemoryConnector on node-b
 ```
 
-Then launch with `--deploy-config my_qwen3_omni_multinode.yaml`. Same
-pattern works for Qwen2.5-Omni — replace `base_config:` with the path to
-`vllm_omni/deploy/qwen2_5_omni.yaml`.
+This is a CPU staging RDMA path, not GPUDirect RDMA:
 
-> ⚠️ Replace `YOUR_METADATA_HOST` / `YOUR_MASTER_HOST` with the actual
-> mooncake server addresses for your cluster. The `base_config:` overlay
-> inherits all stage budgets, devices, and edges from the bundled prod
-> YAML — you only need to spell out the connector swap.
+```text
+sender GPU KV -> sender CPU pool -> RDMA -> receiver CPU pool -> receiver GPU/use site
+```
+
+Prerequisites on both nodes:
+
+- Yuanrong `yr.datasystem.TransferEngine` Python binding is importable.
+- RDMA devices and `rdma-core` runtime are visible.
+- `memlock` is large enough, for example `ulimit -l unlimited`.
+- Containers use host networking and expose `/dev/infiniband`.
+- Firewall allows the Omni master port and connector ports. With the default
+  `--connector-base-port 50051`, the stage0→stage1 KV ZMQ port is `50151`
+  (`base + 100`), and TransferEngine RPC uses an auto-selected port unless
+  `--rpc-port` is set.
+
+Start node-a first:
+
+```bash
+cd examples/online_serving/qwen3_omni
+
+./run_yuanrong_cpu_rdma_two_node.sh \
+  --role node-a \
+  --node-a-host 10.10.10.1 \
+  --node-b-host 10.10.10.2 \
+  --rdma-netdev <node-a-rdma-netdev>
+```
+
+Then start node-b:
+
+```bash
+cd examples/online_serving/qwen3_omni
+
+./run_yuanrong_cpu_rdma_two_node.sh \
+  --role node-b \
+  --node-a-host 10.10.10.1 \
+  --node-b-host 10.10.10.2 \
+  --rdma-netdev <node-b-rdma-netdev>
+```
+
+If automatic RDMA route selection works in your environment, omit
+`--rdma-netdev`. If the machines use different HCA names, use
+`--rdma-device-name`, `--rdma-port`, and `--rdma-gid-index` instead.
+
+Useful options:
+
+```bash
+--pool-size 8589934592          # 8 GiB CPU staging pool per stage worker
+--connector-base-port 51051     # avoid port conflicts
+--rpc-port 65051                # fixed TransferEngine RPC port
+--stage0-devices "0,1"          # override stage 0 devices from the base YAML
+--stage1-devices "0"
+--stage2-devices "0"
+```
+
+The script writes an overlay YAML under `/tmp` by default and passes it through
+`--deploy-config`. The overlay inherits all model budgets and platform-specific
+settings from `vllm_omni/deploy/qwen3_omni_moe.yaml`; it only changes connector
+wiring and the per-node stage device strings.
+
+For non-RDMA bring-up, the same overlay pattern can be used with
+`MooncakeStoreConnector`, but it requires an external Mooncake metadata/master
+service and does not exercise the Yuanrong CPU RDMA path.
 
 ### Send Multi-modal Request
 

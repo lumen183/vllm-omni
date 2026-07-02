@@ -3,7 +3,8 @@
 ## When to Use
 
 Use `YuanrongTransferEngineConnector` for high-performance peer-to-peer KV cache
-transfer on Ascend NPU. It is different from `YuanrongConnector`:
+transfer through Yuanrong TransferEngine. It is different from
+`YuanrongConnector`:
 
 - `YuanrongConnector` uses Yuanrong Datasystem as a distributed KV store and
   requires Datasystem workers plus etcd.
@@ -12,12 +13,15 @@ transfer on Ascend NPU. It is different from `YuanrongConnector`:
   from the sender with TransferEngine.
 
 The implementation currently lives under
-`vllm_omni/platforms/npu/omni_connectors/` because the supported backend is
-Ascend NPU only. The connector is still registered with the generic
+`vllm_omni/platforms/npu/omni_connectors/` for compatibility with the original
+Ascend integration. The connector is still registered with the generic
 OmniConnector factory under the name `YuanrongTransferEngineConnector`.
 
 For Ascend P2P transfer, the connector should use NPU memory as its transfer
-pool. The Mooncake-style CPU pool is not supported for this connector.
+pool. For CPU RDMA transfer, it uses a CPU host memory pool as a staging area:
+GPU KV payloads are copied into the CPU pool before RDMA and copied/restored to
+the target device after receive. This is the same staging model used by
+Mooncake's CPU RDMA connector, not GPUDirect RDMA.
 
 ## Prerequisites
 
@@ -90,6 +94,8 @@ fixed first.
 
 ## YAML Configuration
 
+### Ascend P2P
+
 For Ascend P2P, configure the connector with `protocol: "ascend"` and an NPU
 memory pool:
 
@@ -134,6 +140,55 @@ can lead to Ascend P2P failures such as HCCL RA init errors, QP timeouts, or
 FFTS/SDMA runtime errors. `memory_pool_device: "cpu"` is common for
 `MooncakeTransferEngineConnector`, but Yuanrong TE on Ascend only supports
 `"npu"`.
+
+### CPU RDMA
+
+For CPU RDMA, configure the connector with `protocol: "rdma"` and a CPU memory
+pool:
+
+```yaml
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
+  connectors:
+    yuanrong_cpu_rdma_connector:
+      name: YuanrongTransferEngineConnector
+      extra:
+        host: "auto"
+        zmq_port: 50051
+        rpc_port: "auto"
+        protocol: "rdma"
+        device_name: "auto"
+        memory_pool_size: 4294967296
+        memory_pool_device: "cpu"
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1
+```
+
+Important CPU RDMA fields:
+
+| Parameter | Recommended Value | Notes |
+|---|---|---|
+| `protocol` | `"rdma"` | Uses Yuanrong TransferEngine CPU RDMA backend. |
+| `device_name` | `"auto"` or `"cpu:*"` | `"auto"` resolves to `cpu:*`. |
+| `memory_pool_device` | `"cpu"` | Required. The registered RDMA memory is host memory. |
+| `memory_pool_size` | `4294967296` | 4 GiB per worker is a practical starting point for CPU staging. Increase if KV payloads exceed the pool. |
+
+CPU RDMA data flow:
+
+```text
+sender GPU KV -> CPU pool -> RDMA -> receiver CPU pool -> receiver GPU/use site
+```
+
+The CPU pool is explicitly allocated by this connector and registered with
+TransferEngine via `register_memory(base_ptr, memory_pool_size)`. TransferEngine
+then pins/registers the host range with the CPU RDMA backend. The connector
+returns `ManagedBuffer` objects for fast-path payloads; vLLM Omni consumes those
+buffers and moves reconstructed tensors to the target device when required.
 
 ## 4-Card AR-to-DiT TP Example
 
