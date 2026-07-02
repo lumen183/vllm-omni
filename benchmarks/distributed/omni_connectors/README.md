@@ -206,6 +206,12 @@ in the connector documentation.
 
 The `cross_node_mooncake_transfer_engine.py` script enables testing RDMA transfers between two separate physical machines. This script is **not** auto-discovered by `pytest` (it does not start with `test_`) — it must be run manually on each node.
 
+The `cross_node_yuanrong_transfer_engine.py` script follows the same manual
+producer/consumer shape for `YuanrongTransferEngineConnector`. It uses the
+connector-level `put()`/`get()` path, so the producer registers request metadata
+through the connector ZMQ listener and the consumer pulls data through Yuanrong
+TransferEngine.
+
 ### Prerequisites
 
 1. Both machines have Mooncake installed
@@ -278,6 +284,70 @@ python cross_node_mooncake_transfer_engine.py \
     --benchmark
 ```
 
+### YuanrongTransferEngineConnector Cross-Node Testing
+
+For CPU RDMA, both nodes need the vLLM-Omni connector runtime dependencies
+(`torch`, `pyzmq`, `msgspec`) plus the Yuanrong TransferEngine Python binding
+available and a working RDMA environment. The connector CPU RDMA path uses a CPU
+memory pool, so use `--protocol rdma` with `--mode copy` or `--mode zerocopy`.
+
+**On Machine A (Producer) — start first:**
+
+```bash
+cd benchmarks/distributed/omni_connectors/
+
+python cross_node_yuanrong_transfer_engine.py \
+    --role producer \
+    --local-host <PRODUCER_IP> \
+    --remote-host <CONSUMER_IP> \
+    --local-port 15500 \
+    --local-rpc-port 15502 \
+    --ctrl-port 15501 \
+    --tensor-size-mb 100 \
+    --pool-size-mb 512 \
+    --num-transfers 20 \
+    --protocol rdma \
+    --mode copy
+```
+
+**On Machine B (Consumer) — start after producer:**
+
+```bash
+cd benchmarks/distributed/omni_connectors/
+
+python cross_node_yuanrong_transfer_engine.py \
+    --role consumer \
+    --local-host <CONSUMER_IP> \
+    --remote-host <PRODUCER_IP> \
+    --local-port 15500 \
+    --remote-port 15500 \
+    --local-rpc-port 15502 \
+    --ctrl-port 15501 \
+    --tensor-size-mb 100 \
+    --pool-size-mb 512 \
+    --num-transfers 20 \
+    --protocol rdma \
+    --mode copy
+```
+
+Use `--mode zerocopy` on both nodes to allocate the producer payload directly
+from the connector memory pool. Use `--benchmark` on both nodes to skip random
+data generation and MD5 verification.
+
+Ascend/NPU transfer is exposed through the same script, but it requires a real
+Ascend runtime and HCCN device network:
+
+```bash
+python cross_node_yuanrong_transfer_engine.py \
+    --role producer \
+    --local-host <PRODUCER_HOST_IP> \
+    --remote-host <CONSUMER_HOST_IP> \
+    --protocol ascend \
+    --mode npu \
+    --npu-id 0 \
+    --device-name auto
+```
+
 ### Cross-Node Test Options
 
 | Option | Description | Default |
@@ -293,6 +363,16 @@ python cross_node_mooncake_transfer_engine.py \
 | `--mode` | `copy`, `zerocopy`, or `gpu` | `copy` |
 | `--gpu-id` | GPU ID for GPU mode | 0 |
 | `--benchmark` | Skip MD5, pure performance test | off |
+
+Additional Yuanrong script options:
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--local-rpc-port` | Local Yuanrong TransferEngine RPC port, or `auto` | 15502 |
+| `--pool-size-mb` | Connector memory pool size in MiB | 512 |
+| `--protocol` | Yuanrong TransferEngine protocol: `rdma` or `ascend` | `rdma` |
+| `--device-name` | Yuanrong TransferEngine device name; `auto` resolves to `cpu:*` for RDMA and local NPU for Ascend | `auto` |
+| `--npu-id` | NPU id used for Ascend memory pool mode | 0 |
 
 ---
 
@@ -377,6 +457,7 @@ docker run --gpus all ...
 | `test_mooncake_transfer_engine_rdma.py` | Integration tests for MooncakeTransferEngineConnector (basic, E2E, lifecycle, GPU) | Yes |
 | `test_mooncake_transfer_engine_buffer.py` | Memory pool and buffer management unit tests | Yes |
 | `cross_node_mooncake_transfer_engine.py` | Cross-node (multi-machine) testing script — run manually | No (filename does not start with `test_`) |
+| `cross_node_yuanrong_transfer_engine.py` | Cross-node YuanrongTransferEngineConnector script — run manually | No (filename does not start with `test_`) |
 
 ### test_mooncake_transfer_engine_rdma.py — Test Classes
 
