@@ -290,6 +290,8 @@ For CPU RDMA, both nodes need the vLLM-Omni connector runtime dependencies
 (`torch`, `pyzmq`, `msgspec`) plus the Yuanrong TransferEngine Python binding
 available and a working RDMA environment. The connector CPU RDMA path uses a CPU
 memory pool, so use `--protocol rdma` with `--mode copy` or `--mode zerocopy`.
+This path does not require `vllm_ascend`; `vllm_ascend` is only required when
+the connector is configured for Ascend/NPU transfer.
 
 **On Machine A (Producer) — start first:**
 
@@ -301,7 +303,6 @@ python cross_node_yuanrong_transfer_engine.py \
     --local-host <PRODUCER_IP> \
     --remote-host <CONSUMER_IP> \
     --local-port 15500 \
-    --local-rpc-port 15502 \
     --ctrl-port 15501 \
     --tensor-size-mb 100 \
     --pool-size-mb 512 \
@@ -321,7 +322,6 @@ python cross_node_yuanrong_transfer_engine.py \
     --remote-host <PRODUCER_IP> \
     --local-port 15500 \
     --remote-port 15500 \
-    --local-rpc-port 15502 \
     --ctrl-port 15501 \
     --tensor-size-mb 100 \
     --pool-size-mb 512 \
@@ -368,7 +368,7 @@ Additional Yuanrong script options:
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--local-rpc-port` | Local Yuanrong TransferEngine RPC port, or `auto` | 15502 |
+| `--local-rpc-port` | Local Yuanrong TransferEngine RPC port, or `auto` | `auto` |
 | `--pool-size-mb` | Connector memory pool size in MiB | 512 |
 | `--protocol` | Yuanrong TransferEngine protocol: `rdma` or `ascend` | `rdma` |
 | `--device-name` | Yuanrong TransferEngine device name; `auto` resolves to `cpu:*` for RDMA and local NPU for Ascend | `auto` |

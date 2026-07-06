@@ -48,7 +48,7 @@ def _load_runtime_deps() -> None:
         from vllm_omni.distributed.omni_connectors.utils.memory_pool import (
             ManagedBuffer as managed_buffer_cls,
         )
-        from vllm_omni.platforms.npu.omni_connectors.yuanrong_transfer_engine_connector import (
+        from vllm_omni.distributed.omni_connectors.connectors.yuanrong_transfer_engine_connector import (
             TransferEngine as transfer_engine_cls,
             YuanrongTransferEngineConnector as yuanrong_connector_cls,
         )
@@ -518,7 +518,7 @@ Examples:
     parser.add_argument("--remote-port", type=int, default=15500, help="remote connector ZMQ metadata port")
     parser.add_argument(
         "--local-rpc-port",
-        default="15502",
+        default="auto",
         help="local Yuanrong TransferEngine RPC port, or 'auto'",
     )
     parser.add_argument("--ctrl-port", type=int, default=15501, help="script control channel port")
