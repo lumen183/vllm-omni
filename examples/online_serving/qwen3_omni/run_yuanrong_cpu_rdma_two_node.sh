@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
+source /app/vllm_omni/.venv/bin/activate
 MODEL="Qwen/Qwen3-Omni-30B-A3B-Instruct"
 ROLE=""
 NODE_A_HOST=""
@@ -35,6 +36,7 @@ STAGE0_DEVICES="0"
 STAGE1_DEVICES="0"
 STAGE2_DEVICES="0"
 SSH_TARGET=""
+SSH_PORT=""
 SSH_OPTION=()
 REMOTE_SCRIPT=""
 REMOTE_WORKDIR=""
@@ -96,6 +98,9 @@ Common options:
   --stage1-devices DEVICES             Devices for stage 1 on node-b. Default: 0
   --stage2-devices DEVICES             Devices for stage 2 on node-b. Default: 0
   --ssh-target TARGET                   SSH target for node-b in --role both. Default: node-b-host.
+                                        This is independent from node-b-host, which is the RDMA/ZMQ host.
+                                        Examples: root@10.90.67.90, peer.
+  --ssh-port PORT                       SSH port for node-b in --role both.
   --ssh-option OPTION                   Extra ssh option. Repeat as needed, for example
                                         --ssh-option -p --ssh-option 2222.
   --remote-script PATH                  Remote script path. Default: same absolute path as local script.
@@ -108,7 +113,8 @@ Examples:
   ./run_yuanrong_cpu_rdma_two_node.sh \
       --role both --node-a-host 10.10.10.1 --node-b-host 10.10.10.2 \
       --stage0-devices "6,7" --stage1-devices "6" --stage2-devices "7" \
-      --node-a-rdma-netdev ibp1142s0f1 --node-b-rdma-netdev ibp1142s0f1
+      --node-a-rdma-netdev ibp1142s0f1 --node-b-rdma-netdev ibp1142s0f1 \
+      --ssh-target root@10.90.67.90 --ssh-port 2222
 
   # Node A, start first:
   ./run_yuanrong_cpu_rdma_two_node.sh \
@@ -225,6 +231,11 @@ run_both_nodes() {
   local remote_cmd=("${REMOTE_SCRIPT}" "${node_b_args[@]}")
   local remote_line
   remote_line="cd $(printf '%q' "${REMOTE_WORKDIR}") && $(quote_cmd "${remote_cmd[@]}")"
+  local ssh_cmd=(ssh)
+  if [[ -n "${SSH_PORT}" ]]; then
+    ssh_cmd+=(-p "${SSH_PORT}")
+  fi
+  ssh_cmd+=("${SSH_OPTION[@]}" "${SSH_TARGET}" "${remote_line}")
 
   echo "[INFO] Role: both"
   echo "[INFO] SSH target: ${SSH_TARGET}"
@@ -234,8 +245,8 @@ run_both_nodes() {
   quote_cmd "${local_cmd[@]}"
   printf '\n'
   echo "[INFO] Node-b SSH command:"
-  printf '  ssh '
-  quote_cmd "${SSH_OPTION[@]}" "${SSH_TARGET}" "${remote_line}"
+  printf '  '
+  quote_cmd "${ssh_cmd[@]}"
   printf '\n'
 
   if [[ "${DRY_RUN}" == "true" ]]; then
@@ -251,7 +262,7 @@ run_both_nodes() {
   }
   trap cleanup INT TERM EXIT
 
-  ssh "${SSH_OPTION[@]}" "${SSH_TARGET}" "${remote_line}" &
+  "${ssh_cmd[@]}" &
   pids+=("$!")
 
   sleep "${REMOTE_START_DELAY}"
@@ -301,6 +312,7 @@ while [[ $# -gt 0 ]]; do
     --stage1-devices) STAGE1_DEVICES="$2"; shift 2 ;;
     --stage2-devices) STAGE2_DEVICES="$2"; shift 2 ;;
     --ssh-target) SSH_TARGET="$2"; shift 2 ;;
+    --ssh-port) SSH_PORT="$2"; shift 2 ;;
     --ssh-option) SSH_OPTION+=("$2"); shift 2 ;;
     --remote-script) REMOTE_SCRIPT="$2"; shift 2 ;;
     --remote-workdir) REMOTE_WORKDIR="$2"; shift 2 ;;
