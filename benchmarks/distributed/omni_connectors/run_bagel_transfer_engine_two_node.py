@@ -37,6 +37,7 @@ RUN_DIR = Path("/tmp/vllm-omni-bagel-cross-node")
 # activated explicitly. Override this when the remote checkout uses another
 # location, for example: VLLM_OMNI_REMOTE_VENV=/opt/vllm-omni/.venv.
 REMOTE_VENV = Path(os.environ.get("VLLM_OMNI_REMOTE_VENV", "/app/vllm-omni/.venv"))
+REMOTE_CUDA_HOME = os.environ.get("VLLM_OMNI_REMOTE_CUDA_HOME", "/usr/local/cuda-13.0")
 ERROR_PATTERN = re.compile(r"Traceback|\bERROR\b|\bException\b|\bRuntimeError\b", re.IGNORECASE)
 
 
@@ -148,9 +149,21 @@ def _append_command_output(log_path: Path, result: subprocess.CompletedProcess[s
 
 def _ssh(host: str, command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
     # `ssh host command` does not source the user's interactive shell setup.
-    # Use bash explicitly so that activation also affects subprocesses started
-    # by the remote Python process (notably the bare `vllm` command).
-    remote_command = f"source {shlex.quote(str(REMOTE_VENV / 'bin/activate'))} && exec {shlex.join(command)}"
+    # Use bash explicitly and set CUDA variables so that activation also
+    # affects subprocesses started by the remote Python process.
+    cuda_home = shlex.quote(REMOTE_CUDA_HOME)
+    venv_activate = shlex.quote(str(REMOTE_VENV / "bin/activate"))
+    remote_command = (
+        # CUDA is often configured only in ~/.bashrc on compute nodes.
+        'source ~/.bashrc >/dev/null 2>&1 || true; '
+        f"cuda_home=\"${{CUDA_HOME:-{cuda_home}}}\"; "
+        'if [ ! -d "$cuda_home" ] && [ -d /usr/local/cuda ]; then '
+        'cuda_home=/usr/local/cuda; fi; '
+        'export CUDA_HOME="$cuda_home" CUDA_PATH="$cuda_home"; '
+        'export PATH="$cuda_home/bin:$PATH"; '
+        'export LD_LIBRARY_PATH="$cuda_home/lib64:$cuda_home/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; '
+        f"source {venv_activate} && exec {shlex.join(command)}"
+    )
     return subprocess.run(
         ["ssh", "-o", "BatchMode=yes", host, shlex.join(["bash", "-lc", remote_command])],
         text=True,
