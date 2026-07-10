@@ -33,6 +33,10 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT_PATH = Path(__file__).resolve()
 BENCH_SCRIPT = SCRIPT_PATH.with_name("bagel_te_bench.py")
 RUN_DIR = Path("/tmp/vllm-omni-bagel-cross-node")
+# SSH runs a non-interactive shell, so the remote virtual environment must be
+# activated explicitly. Override this when the remote checkout uses another
+# location, for example: VLLM_OMNI_REMOTE_VENV=/opt/vllm-omni/.venv.
+REMOTE_VENV = Path(os.environ.get("VLLM_OMNI_REMOTE_VENV", "/app/vllm-omni/.venv"))
 ERROR_PATTERN = re.compile(r"Traceback|\bERROR\b|\bException\b|\bRuntimeError\b", re.IGNORECASE)
 
 
@@ -143,8 +147,12 @@ def _append_command_output(log_path: Path, result: subprocess.CompletedProcess[s
 
 
 def _ssh(host: str, command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    # `ssh host command` does not source the user's interactive shell setup.
+    # Use bash explicitly so that activation also affects subprocesses started
+    # by the remote Python process (notably the bare `vllm` command).
+    remote_command = f"source {shlex.quote(str(REMOTE_VENV / 'bin/activate'))} && exec {shlex.join(command)}"
     return subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", host, shlex.join(command)],
+        ["ssh", "-o", "BatchMode=yes", host, shlex.join(["bash", "-lc", remote_command])],
         text=True,
         capture_output=True,
         check=check,
@@ -153,7 +161,8 @@ def _ssh(host: str, command: list[str], *, check: bool = True) -> subprocess.Com
 
 def _remote_script_command(mode: str, args: argparse.Namespace) -> list[str]:
     return [
-        sys.executable,
+        # `_ssh()` activates the remote venv before this command runs.
+        "python",
         str(SCRIPT_PATH),
         mode,
         "--stage0-host",
