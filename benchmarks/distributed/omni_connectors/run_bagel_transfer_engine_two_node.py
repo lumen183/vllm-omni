@@ -267,13 +267,20 @@ def _start_stage1_remote(args: argparse.Namespace) -> None:
 def _wait_for_startup(stage0: subprocess.Popen[Any], args: argparse.Namespace) -> None:
     deadline = time.monotonic() + args.startup_timeout
     stage0_log = RUN_DIR / "stage0.log"
+    startup_log_warning_reported = False
     while time.monotonic() < deadline:
         if stage0.poll() is not None:
             raise RuntimeError(f"Stage 0 exited during startup with status {stage0.returncode}")
         if not _remote_alive(args):
             raise RuntimeError("Stage 1 exited during startup")
-        if _has_startup_error(stage0_log) or _remote_has_startup_error(args):
-            raise RuntimeError("Detected a startup error in a vLLM service log")
+        # Log scanners are only diagnostic: vLLM and CUDA dependencies can
+        # emit transient ERROR/Traceback text while a process is still
+        # starting. Process liveness and the health endpoint are authoritative.
+        if not startup_log_warning_reported and (
+            _has_startup_error(stage0_log) or _remote_has_startup_error(args)
+        ):
+            _log("Startup log contains an error-like line; continuing to wait because both stages are alive")
+            startup_log_warning_reported = True
         if _api_ready(args.stage0_ip, args.api_port):
             _log(f"API is ready on {args.stage0_ip}:{args.api_port}")
             return
