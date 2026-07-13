@@ -20,7 +20,7 @@ import json
 import sys
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -147,6 +147,18 @@ class TransferStats:
     fail_count: int = 0
     total_bytes: int = 0
     elapsed_time: float = 0.0
+    get_times_ms: list[float] = field(default_factory=list)
+
+    def record_get(self, elapsed_ms: float) -> None:
+        self.get_times_ms.append(elapsed_ms)
+
+    @staticmethod
+    def _percentile(values: list[float], percentile: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        index = min(len(ordered) - 1, max(0, int((len(ordered) - 1) * percentile)))
+        return ordered[index]
 
     @property
     def throughput_mbps(self) -> float:
@@ -163,6 +175,11 @@ class TransferStats:
         print(f"  Total:      {self.total_bytes / (1024 * 1024):.2f} MB")
         print(f"  Time:       {self.elapsed_time:.2f} s")
         print(f"  Throughput: {self.throughput_mbps:.2f} MB/s")
+        if self.get_times_ms:
+            avg_ms = sum(self.get_times_ms) / len(self.get_times_ms)
+            p50_ms = self._percentile(self.get_times_ms, 0.50)
+            p95_ms = self._percentile(self.get_times_ms, 0.95)
+            print(f"  Connector get: avg={avg_ms:.1f} ms, p50={p50_ms:.1f} ms, p95={p95_ms:.1f} ms")
         print(f"{'=' * 60}")
 
 
@@ -299,14 +316,14 @@ class Producer(CrossNodeTester):
         if not self.config.benchmark:
             print(f"\n[PRODUCER] Transfer {transfer_idx + 1}/{self.config.num_transfers}")
 
-        t0 = time.time()
+        t0 = time.perf_counter()
         data, md5, data_size = self.create_test_data(transfer_idx)
         caller_owned_buffer = data if isinstance(data, ManagedBuffer) else None
-        t_create = time.time() - t0
+        t_create = time.perf_counter() - t0
 
-        t1 = time.time()
+        t1 = time.perf_counter()
         success, size, _metadata = self.connector.put("producer", "consumer", req_id, data)
-        t_put = time.time() - t1
+        t_put = time.perf_counter() - t1
         if not success:
             self.stats.fail_count += 1
             if caller_owned_buffer is not None:
@@ -360,15 +377,15 @@ class Producer(CrossNodeTester):
             if not self.wait_for_consumer():
                 return
 
-            start_time = time.time()
+            start_time = time.perf_counter()
             for idx in range(self.config.num_transfers):
                 self.do_transfer(idx)
                 if self.config.benchmark and (idx + 1) % 10 == 0:
-                    elapsed = time.time() - start_time
+                    elapsed = time.perf_counter() - start_time
                     mbps = (self.stats.total_bytes / (1024 * 1024)) / max(elapsed, 1e-9)
                     print(f"  Progress: {idx + 1}/{self.config.num_transfers}, Throughput: {mbps:.2f} MB/s")
 
-            self.stats.elapsed_time = time.time() - start_time
+            self.stats.elapsed_time = time.perf_counter() - start_time
             self.stats.print_summary("PRODUCER")
 
             assert self.ctrl_socket is not None
@@ -427,9 +444,13 @@ class Consumer(CrossNodeTester):
             print(f"[CONSUMER] Unexpected message: {msg.msg_type}")
             return False
 
-        t0 = time.time()
+        t0 = time.perf_counter()
         result = self.connector.get("producer", "consumer", msg.request_id, metadata=None)
-        t_get = time.time() - t0
+        t_get = time.perf_counter() - t0
+        t_get_ms = t_get * 1000
+        self.stats.record_get(t_get_ms)
+        if self.config.benchmark:
+            print(f"[YR SCRIPT GET] {msg.request_id}: get={t_get_ms:.1f}ms")
         response = CtrlMsg(msg_type="ERROR", error="Get failed")
 
         if result is None:
@@ -438,7 +459,7 @@ class Consumer(CrossNodeTester):
         else:
             recv_buffer, recv_size = result
             if not self.config.benchmark:
-                print(f"  [OK] Get successful, {recv_size} bytes ({t_get * 1000:.1f} ms)")
+                print(f"  [OK] Get successful, {recv_size} bytes ({t_get_ms:.1f} ms)")
 
             try:
                 if self.config.benchmark or not msg.md5:
@@ -474,16 +495,16 @@ class Consumer(CrossNodeTester):
             if not self.connect_to_producer():
                 return
 
-            start_time = time.time()
+            start_time = time.perf_counter()
             for idx in range(self.config.num_transfers):
                 if not self.do_transfer(idx):
                     break
                 if self.config.benchmark and (idx + 1) % 10 == 0:
-                    elapsed = time.time() - start_time
+                    elapsed = time.perf_counter() - start_time
                     mbps = (self.stats.total_bytes / (1024 * 1024)) / max(elapsed, 1e-9)
                     print(f"  Progress: {idx + 1}/{self.config.num_transfers}, Throughput: {mbps:.2f} MB/s")
 
-            self.stats.elapsed_time = time.time() - start_time
+            self.stats.elapsed_time = time.perf_counter() - start_time
             self.stats.print_summary("CONSUMER")
 
             assert self.ctrl_socket is not None
