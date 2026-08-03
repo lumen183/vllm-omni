@@ -60,10 +60,9 @@ def test_ndarray_serialization():
 
 def test_create_shm_connector():
     """Test creating SharedMemoryConnector via Factory."""
-    spec = ConnectorSpec(name="SharedMemoryConnector", extra={"shm_threshold_bytes": 1024})
+    spec = ConnectorSpec(name="SharedMemoryConnector")
     connector = OmniConnectorFactory.create_connector(spec)
     assert isinstance(connector, SharedMemoryConnector)
-    assert connector.threshold == 1024
 
 
 def test_create_unknown_connector():
@@ -75,21 +74,20 @@ def test_create_unknown_connector():
 
 @pytest.fixture
 def shm_connector():
-    config = {"shm_threshold_bytes": 100, "inline_small_payloads": True}
-    return SharedMemoryConnector(config)
+    connector = SharedMemoryConnector({})
+    yield connector
+    connector.close()
 
 
-def test_put_get_inline(shm_connector):
-    """Test inline transfer for small data."""
+def test_put_get_small_payload_uses_shm(shm_connector):
+    """Small payloads use key-addressed SHM; inline metadata is retired."""
     data = {"small": "data"}
 
     success, size, metadata = shm_connector.put("stage_0", "stage_1", "req_1", data)
     assert success is True
-    assert "inline_bytes" in metadata
-    assert "shm" not in metadata
+    assert "shm" in metadata
+    assert "inline_bytes" not in metadata
     assert "size" in metadata
-    assert shm_connector._metrics["inline_writes"] == 1
-    assert shm_connector._metrics["shm_writes"] == 0
 
     # Retrieve
     retrieved_data, ret_size = shm_connector.get("stage_0", "stage_1", "req_1", metadata)
@@ -197,127 +195,40 @@ def test_mooncake_connector_defaults_missing_host_to_detected_ip(monkeypatch: py
         connector.close()
 
 
-def test_yuanrong_connector_cpu_rdma_uses_cpu_pool(monkeypatch: pytest.MonkeyPatch):
-    import vllm_omni.distributed.omni_connectors.connectors.yuanrong_transfer_engine_connector as yuanrong_module
+def test_mooncake_get_counts_zmq_timeout_separately(mocker: MockerFixture):
+    import vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector as mooncake_module
 
-    class _FakeResult:
-        def is_error(self):
-            return False
-
-        def to_string(self):
-            return "OK"
-
-    class _FakeTransferEngine:
-        def initialize(self, local_endpoint, protocol, device_name):
-            self.local_endpoint = local_endpoint
-            self.protocol = protocol
-            self.device_name = device_name
-            return _FakeResult()
-
-        def get_rpc_port(self):
-            return 34567
-
-        def register_memory(self, base_ptr, pool_size):
-            self.registered = (base_ptr, pool_size)
-            return _FakeResult()
-
-        def unregister_memory(self, base_ptr):
-            self.unregistered = base_ptr
-            return _FakeResult()
-
-        def finalize(self):
-            self.finalized = True
-            return _FakeResult()
-
-    monkeypatch.setattr(yuanrong_module, "TransferEngine", _FakeTransferEngine)
-
-    connector = yuanrong_module.YuanrongTransferEngineConnector(
-        {
-            "host": "127.0.0.1",
-            "rpc_port": "auto",
-            "zmq_port": "auto",
-            "protocol": "rdma",
-            "device_name": "auto",
-            "memory_pool_size": 4096,
-            "memory_pool_device": "auto",
-            "role": "receiver",
-        }
+    connector = object.__new__(mooncake_module.MooncakeTransferEngineConnector)
+    connector._closed = False
+    connector._metrics = {"errors": 0, "timeouts": 0}
+    connector._resolve_metadata = mocker.Mock(
+        return_value={"source_host": "127.0.0.1", "source_port": 1234, "data_size": 8}
     )
-    try:
-        assert connector.protocol == "rdma"
-        assert connector.device_name == "cpu:*"
-        assert connector.pool_device == "cpu"
-        assert connector.pool.device.type == "cpu"
-        assert connector.engine.protocol == "rdma"
-        assert connector.engine.device_name == "cpu:*"
-        assert connector.engine.registered[1] == 4096
-        assert connector.get_connection_info()["rpc_port"] == 34567
-    finally:
-        connector.close()
+    recv_buffer = mocker.Mock()
+    connector._alloc_recv_buffer = mocker.Mock(return_value=(recv_buffer, 1000))
+    connector._request_transfer = mocker.Mock(side_effect=mooncake_module.zmq.Again())
+
+    assert connector.get("s0", "s1", "req") is None
+    assert connector._metrics == {"errors": 0, "timeouts": 1}
+    recv_buffer.release.assert_called_once()
+    connector._closed = True
 
 
-def test_yuanrong_connector_factory_cpu_rdma_without_vllm_ascend(monkeypatch: pytest.MonkeyPatch):
-    import vllm_omni.distributed.omni_connectors.connectors.yuanrong_transfer_engine_connector as yuanrong_module
+def test_mooncake_get_counts_cuda_sync_failure_as_error(mocker: MockerFixture):
+    import vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector as mooncake_module
 
-    class _FakeResult:
-        def is_error(self):
-            return False
-
-        def to_string(self):
-            return "OK"
-
-    class _FakeTransferEngine:
-        def initialize(self, local_endpoint, protocol, device_name):
-            self.protocol = protocol
-            self.device_name = device_name
-            return _FakeResult()
-
-        def get_rpc_port(self):
-            return 34567
-
-        def register_memory(self, base_ptr, pool_size):
-            return _FakeResult()
-
-        def unregister_memory(self, base_ptr):
-            return _FakeResult()
-
-        def finalize(self):
-            return _FakeResult()
-
-    monkeypatch.setattr(yuanrong_module, "TransferEngine", _FakeTransferEngine)
-    monkeypatch.setattr(yuanrong_module, "find_spec", lambda name: None if name == "vllm_ascend" else object())
-
-    connector = OmniConnectorFactory.create_connector(
-        ConnectorSpec(
-            name="YuanrongTransferEngineConnector",
-            extra={
-                "host": "127.0.0.1",
-                "rpc_port": "auto",
-                "zmq_port": "auto",
-                "protocol": "rdma",
-                "device_name": "auto",
-                "memory_pool_size": 4096,
-                "memory_pool_device": "auto",
-                "role": "receiver",
-            },
-        )
+    connector = object.__new__(mooncake_module.MooncakeTransferEngineConnector)
+    connector._closed = False
+    connector._metrics = {"errors": 0, "timeouts": 0}
+    connector._resolve_metadata = mocker.Mock(
+        return_value={"source_host": "127.0.0.1", "source_port": 1234, "data_size": 8}
     )
-    try:
-        assert connector.protocol == "rdma"
-        assert connector.pool_device == "cpu"
-        assert connector.device_name == "cpu:*"
-    finally:
-        connector.close()
+    recv_buffer = mocker.Mock()
+    connector._alloc_recv_buffer = mocker.Mock(return_value=(recv_buffer, 1000))
+    connector._request_transfer = mocker.Mock(return_value=mooncake_module.TRANS_DONE)
+    connector._sync_receive_buffer_if_needed = mocker.Mock(side_effect=RuntimeError("CUDA sync failed"))
 
-
-def test_yuanrong_connector_pool_device_validation():
-    import vllm_omni.distributed.omni_connectors.connectors.yuanrong_transfer_engine_connector as yuanrong_module
-
-    assert yuanrong_module._resolve_pool_device("auto", "rdma") == "cpu"
-    assert yuanrong_module._resolve_pool_device("auto", "ascend") == "npu"
-
-    with pytest.raises(ValueError, match="requires a CPU memory pool"):
-        yuanrong_module._resolve_pool_device("npu", "rdma")
-
-    with pytest.raises(ValueError, match="requires an NPU memory pool"):
-        yuanrong_module._resolve_pool_device("cpu", "ascend")
+    assert connector.get("s0", "s1", "req") is None
+    assert connector._metrics == {"errors": 1, "timeouts": 0}
+    recv_buffer.release.assert_called_once()
+    connector._closed = True

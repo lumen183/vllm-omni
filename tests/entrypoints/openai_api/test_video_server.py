@@ -12,6 +12,7 @@ import os
 import threading
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -44,22 +45,17 @@ class MockVideoResult:
         videos,
         audios=None,
         sample_rate=None,
-        custom_output=None,
+        multimodal_output=None,
         stage_durations=None,
         peak_memory_mb=0.0,
     ):
-        self.multimodal_output = {"video": videos}
+        self.multimodal_output = dict(multimodal_output or {"video": videos})
         if audios is not None:
             self.multimodal_output["audio"] = audios
         if sample_rate is not None:
             self.multimodal_output["audio_sample_rate"] = sample_rate
-        self._custom_output = custom_output or {}
         self.stage_durations = stage_durations or {}
         self.peak_memory_mb = peak_memory_mb
-
-    @property
-    def custom_output(self):
-        return self._custom_output
 
 
 class FakeAsyncOmni:
@@ -67,11 +63,19 @@ class FakeAsyncOmni:
         self.stage_configs = [SimpleNamespace(stage_type="diffusion")]
         self.default_sampling_params_list = [OmniDiffusionSamplingParams()]
         self.captured_prompt = None
+        self.captured_reference_video_bytes = None
         self.captured_sampling_params_list = None
 
     async def generate(self, prompt, request_id, sampling_params_list):
         self.captured_prompt = prompt
         self.captured_sampling_params_list = sampling_params_list
+        reference_videos = prompt.get("multi_modal_data", {}).get("video")
+        if (
+            isinstance(reference_videos, list)
+            and reference_videos
+            and all(isinstance(item, str) for item in reference_videos)
+        ):
+            self.captured_reference_video_bytes = [Path(item).read_bytes() for item in reference_videos]
         num_outputs = sampling_params_list[0].num_outputs_per_prompt
         videos = [object() for _ in range(num_outputs)]
         yield MockVideoResult(videos)
@@ -506,6 +510,44 @@ def test_v2v_video_generation_with_video_reference_form(test_client, mocker: Moc
     assert input_video[0].size == (32, 24)
 
 
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+def test_multi_video_generation_preserves_uploaded_files_until_generation(
+    endpoint,
+    test_client,
+    mocker: MockerFixture,
+):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    response = test_client.post(
+        endpoint,
+        data={
+            "prompt": "Composite the subject from the first video into the second.",
+            "extra_params": json.dumps({"task": "ref2va", "duration": 15.0}),
+        },
+        files=[
+            ("input_references", ("subject.mp4", b"subject-video", "video/mp4")),
+            ("input_references", ("background.mov", b"background-video", "video/quicktime")),
+        ],
+    )
+
+    assert response.status_code == 200
+    if endpoint.endswith("/sync"):
+        assert response.content == b"fake-video"
+    else:
+        video_id = response.json()["id"]
+        _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    input_videos = engine.captured_prompt["multi_modal_data"]["video"]
+    assert engine.captured_reference_video_bytes == [b"subject-video", b"background-video"]
+    assert len(input_videos) == 2
+    assert all(not Path(path).exists() for path in input_videos)
+    assert engine.captured_sampling_params_list[0].extra_args["task"] == "ref2va"
+    assert engine.captured_sampling_params_list[0].extra_args["duration"] == 15.0
+
+
 def test_decode_video_bytes_can_keep_last_frames():
     from vllm_omni.entrypoints.openai.video_api_utils import _decode_video_bytes
 
@@ -835,7 +877,13 @@ def test_worker_fps_multiplier_is_applied_to_async_encoding(test_client, mocker:
         engine.captured_sampling_params_list = sampling_params_list
         import numpy as np
 
-        yield MockVideoResult([np.zeros((1, 64, 64, 3), dtype=np.uint8)], custom_output={"video_fps_multiplier": 2})
+        yield MockVideoResult(
+            [np.zeros((1, 64, 64, 3), dtype=np.uint8)],
+            multimodal_output={
+                "video": [np.zeros((1, 64, 64, 3), dtype=np.uint8)],
+                "metadata": {"video": {"video_fps_multiplier": 2}},
+            },
+        )
 
     engine.generate = _generate
 
@@ -939,11 +987,16 @@ def test_video_generation_response_exposes_action_payload(mocker: MockerFixture)
 
         yield MockVideoResult(
             [object()],
-            custom_output={
-                "action": np.array([[[1.5, 2.5], [3.5, 4.5]]], dtype=np.float32),
-                "raw_action_dim": 2,
-                "action_mode": "policy",
-                "domain_id": 7,
+            multimodal_output={
+                "video": [object()],
+                "actions": np.array([[[1.5, 2.5], [3.5, 4.5]]], dtype=np.float32),
+                "metadata": {
+                    "actions": {
+                        "raw_action_dim": 2,
+                        "action_mode": "policy",
+                        "domain_id": 7,
+                    },
+                },
             },
         )
 
@@ -981,11 +1034,16 @@ def test_video_job_persists_action_metadata(test_client, mocker: MockerFixture):
         engine.captured_sampling_params_list = sampling_params_list
         yield MockVideoResult(
             [object()],
-            custom_output={
-                "action": np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float32),
-                "raw_action_dim": 2,
-                "action_mode": "policy",
-                "domain_id": 7,
+            multimodal_output={
+                "video": [object()],
+                "actions": np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float32),
+                "metadata": {
+                    "actions": {
+                        "raw_action_dim": 2,
+                        "action_mode": "policy",
+                        "domain_id": 7,
+                    },
+                },
             },
         )
 
@@ -1019,12 +1077,41 @@ def test_action_extraction_accepts_unbatched_action():
 
     result = MockVideoResult(
         [object()],
-        custom_output={
-            "action": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
-            "raw_action_dim": 2,
-            "action_mode": "policy",
-            "domain_id": 7,
+        multimodal_output={
+            "video": [object()],
+            "actions": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+            "metadata": {
+                "actions": {
+                    "raw_action_dim": 2,
+                    "action_mode": "policy",
+                    "domain_id": 7,
+                },
+            },
         },
+    )
+
+    actions = OmniOpenAIServingVideo._extract_action_outputs(result, expected_count=1)
+
+    assert actions and actions[0] is not None
+    assert actions[0].data == [[1.0, 2.0], [3.0, 4.0]]
+    assert actions[0].shape == [2, 2]
+
+
+def test_action_extraction_accepts_multimodal_actions_payload():
+    import numpy as np
+
+    result = MockVideoResult([object()])
+    result.multimodal_output.update(
+        {
+            "actions": np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float32),
+            "metadata": {
+                "actions": {
+                    "raw_action_dim": 2,
+                    "action_mode": "policy",
+                    "domain_id": 7,
+                },
+            },
+        }
     )
 
     actions = OmniOpenAIServingVideo._extract_action_outputs(result, expected_count=1)
@@ -1032,6 +1119,9 @@ def test_action_extraction_accepts_unbatched_action():
     assert actions[0] is not None
     assert actions[0].data == [[1.0, 2.0], [3.0, 4.0]]
     assert actions[0].shape == [2, 2]
+    assert actions[0].raw_action_dim == 2
+    assert actions[0].action_mode == "policy"
+    assert actions[0].domain_id == 7
 
 
 def test_missing_handler_returns_503():
@@ -1840,7 +1930,13 @@ def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: 
     async def _generate(prompt, request_id, sampling_params_list):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
-        yield MockVideoResult([object()], custom_output={"video_fps_multiplier": 2})
+        yield MockVideoResult(
+            [object()],
+            multimodal_output={
+                "video": [object()],
+                "metadata": {"video": {"video_fps_multiplier": 2}},
+            },
+        )
 
     engine.generate = _generate
 
