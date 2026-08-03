@@ -94,6 +94,20 @@ def _connector_config(role: str, *, rpc_port: int | str = "auto", zmq_port: int 
     }
 
 
+def test_rdma_cuda_device_resolution(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(yuanrong_module, "get_connector_local_rank", lambda: 2)
+
+    assert yuanrong_module._resolve_pool_device("cuda", "rdma") == "cuda:2"
+    assert yuanrong_module._resolve_pool_device("cuda:3", "rdma") == "cuda:3"
+    assert yuanrong_module._resolve_device_name("auto", "rdma", "cuda:2") == "cuda:2"
+    assert yuanrong_module._resolve_device_name("cuda:3", "rdma", "cuda:3") == "cuda:3"
+
+
+def test_rdma_cuda_endpoint_must_match_pool():
+    with pytest.raises(ValueError, match="must match the CUDA memory pool"):
+        yuanrong_module._validate_device_and_pool("cuda:0", "cuda:1", "rdma")
+
+
 def test_initialization_health_and_connection_info():
     connector = yuanrong_module.YuanrongTransferEngineConnector(
         _connector_config("sender", rpc_port=_free_port(), zmq_port=_free_port())

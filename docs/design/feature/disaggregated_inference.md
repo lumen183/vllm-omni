@@ -15,7 +15,9 @@ Backend-specific setup lives in separate docs:
 ## Overview
 
 Connectors enable data transfer between pipeline stages (e.g., Thinker -> Talker).
-Current connectors operate in D2H2D (device to host to device) mode.
+Most connectors operate in D2H2D (device to host to device) mode; Yuanrong
+TransferEngine can additionally use CUDA GPUDirect RDMA when built with its GPU
+backend and configured with a CUDA memory pool.
 
 ## Connector Choices
 
@@ -27,6 +29,7 @@ Current connectors operate in D2H2D (device to host to device) mode.
 | Multi node (Mori RDMA) | MoriTransferEngineConnector | RDMA direct transfer via Mori IOEngine. |
 | Multi node (Yuanrong) | YuanrongConnector | Requires Yuanrong Datasystem + etcd. |
 | Ascend NPU P2P (Yuanrong TE) | YuanrongTransferEngineConnector | Uses Yuanrong TransferEngine directly. Configure NPU device IPv4 and `memory_pool_device: "npu"`. |
+| CUDA GPUDirect RDMA (Yuanrong TE) | YuanrongTransferEngineConnector | Build Yuanrong with `-X gpu`; configure `protocol: "rdma"` and `memory_pool_device: "cuda"`. |
 
 ## Core API
 

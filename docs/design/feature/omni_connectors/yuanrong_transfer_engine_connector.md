@@ -12,10 +12,11 @@ transfer through Yuanrong TransferEngine. It is different from
   registers local memory in each stage worker and lets the receiver pull data
   from the sender with TransferEngine.
 
-The implementation currently lives under
-`vllm_omni/platforms/npu/omni_connectors/` for compatibility with the original
-Ascend integration. The connector is still registered with the generic
-OmniConnector factory under the name `YuanrongTransferEngineConnector`.
+The implementation lives under
+`vllm_omni/distributed/omni_connectors/connectors/`; the NPU platform path is
+kept as a compatibility re-export for the original Ascend integration. The
+connector is registered with the generic OmniConnector factory under the name
+`YuanrongTransferEngineConnector`.
 
 For Ascend P2P transfer, the connector should use NPU memory as its transfer
 pool. For CPU RDMA transfer, it uses a CPU host memory pool as a staging area:
@@ -189,6 +190,45 @@ TransferEngine via `register_memory(base_ptr, memory_pool_size)`. TransferEngine
 then pins/registers the host range with the CPU RDMA backend. The connector
 returns `ManagedBuffer` objects for fast-path payloads; vLLM Omni consumes those
 buffers and moves reconstructed tensors to the target device when required.
+
+### CUDA GPUDirect RDMA
+
+The Yuanrong TransferEngine in `../ready2merge` also supports CUDA device memory
+through the same `protocol: "rdma"` path. Build and install its Python binding
+with CUDA RDMA enabled before starting vLLM Omni:
+
+```bash
+cd ../ready2merge/transfer_engine
+CUDA_HOME_PATH=/usr/local/cuda \
+TRANSFER_ENGINE_PYTHON=/path/to/python3 \
+TRANSFER_ENGINE_PYTHON_INSTALL=ON \
+bash build.sh -B build-gpu -X gpu -P on
+```
+
+The GPU build requires the CUDA Driver headers and `libcuda`; runtime
+GPUDirect RDMA additionally requires a compatible NVIDIA GPU/HCA PCIe topology
+and `nvidia-peermem`. Use the same GPU ordinal on each endpoint's
+`device_name` and `memory_pool_device`:
+
+```yaml
+connectors:
+  yuanrong_cuda_rdma_connector:
+    name: YuanrongTransferEngineConnector
+    extra:
+      host: "auto"
+      zmq_port: 50051
+      rpc_port: "auto"
+      protocol: "rdma"
+      device_name: "auto"       # resolves to cuda:<local TP rank>
+      memory_pool_size: 4294967296
+      memory_pool_device: "cuda" # resolves to cuda:<local TP rank>
+```
+
+Explicit values are also supported, for example `device_name: "cuda:1"` and
+`memory_pool_device: "cuda:1"`. The connector rejects mismatched CUDA ordinals
+because TransferEngine must register the memory pool on the endpoint's device.
+Compared with the CPU-pool path, this avoids the GPU-to-host staging copy but
+is only beneficial when the NIC can directly access the GPU memory.
 
 ## 4-Card AR-to-DiT TP Example
 

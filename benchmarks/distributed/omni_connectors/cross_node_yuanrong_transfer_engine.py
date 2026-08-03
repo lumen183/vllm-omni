@@ -8,8 +8,9 @@ YuanrongTransferEngineConnector directly. The connector data plane is
 requester-pull: producer calls put(), consumer calls get(), and the consumer
 pulls from producer with Yuanrong TransferEngine.
 
-CPU RDMA uses a host memory pool. Ascend/NPU mode uses an NPU memory pool and
-requires a working Ascend TransferEngine runtime.
+CPU RDMA uses a host memory pool. CUDA RDMA uses a CUDA memory pool for
+GPUDirect RDMA. Ascend/NPU mode uses an NPU memory pool and requires a working
+Ascend TransferEngine runtime.
 """
 
 from __future__ import annotations
@@ -131,6 +132,7 @@ class TransferConfig:
     device_name: str
     gpu_id: int
     npu_id: int
+    memory_pool_device: str
 
     @property
     def data_size(self) -> int:
@@ -140,6 +142,30 @@ class TransferConfig:
     def pool_size(self) -> int:
         return self.pool_size_mb * 1024 * 1024
 
+    @property
+    def resolved_pool_device(self) -> str:
+        """Resolve the connector pool device for this benchmark mode."""
+        if self.protocol != "rdma":
+            return f"npu:{self.npu_id}"
+
+        configured = self.memory_pool_device.strip().lower()
+        if configured in {"", "auto"}:
+            return f"cuda:{self.gpu_id}" if self.mode == "gpu" else "cpu"
+        if configured == "cuda":
+            return f"cuda:{self.gpu_id}"
+        return configured
+
+    @property
+    def requires_cuda(self) -> bool:
+        return self.mode == "gpu" or self.resolved_pool_device.startswith("cuda:")
+
+    @property
+    def cuda_device_id(self) -> int:
+        pool_device = self.resolved_pool_device
+        if pool_device.startswith("cuda:"):
+            return int(pool_device.split(":", 1)[1])
+        return self.gpu_id
+
 
 @dataclass
 class TransferStats:
@@ -147,10 +173,10 @@ class TransferStats:
     fail_count: int = 0
     total_bytes: int = 0
     elapsed_time: float = 0.0
-    get_times_ms: list[float] = field(default_factory=list)
+    timing_samples_ms: dict[str, list[float]] = field(default_factory=dict)
 
-    def record_get(self, elapsed_ms: float) -> None:
-        self.get_times_ms.append(elapsed_ms)
+    def record_timing(self, name: str, elapsed_ms: float) -> None:
+        self.timing_samples_ms.setdefault(name, []).append(elapsed_ms)
 
     @staticmethod
     def _percentile(values: list[float], percentile: float) -> float:
@@ -175,11 +201,13 @@ class TransferStats:
         print(f"  Total:      {self.total_bytes / (1024 * 1024):.2f} MB")
         print(f"  Time:       {self.elapsed_time:.2f} s")
         print(f"  Throughput: {self.throughput_mbps:.2f} MB/s")
-        if self.get_times_ms:
-            avg_ms = sum(self.get_times_ms) / len(self.get_times_ms)
-            p50_ms = self._percentile(self.get_times_ms, 0.50)
-            p95_ms = self._percentile(self.get_times_ms, 0.95)
-            print(f"  Connector get: avg={avg_ms:.1f} ms, p50={p50_ms:.1f} ms, p95={p95_ms:.1f} ms")
+        for name, samples in self.timing_samples_ms.items():
+            if not samples:
+                continue
+            avg_ms = sum(samples) / len(samples)
+            p50_ms = self._percentile(samples, 0.50)
+            p95_ms = self._percentile(samples, 0.95)
+            print(f"  {name}: avg={avg_ms:.1f} ms, p50={p50_ms:.1f} ms, p95={p95_ms:.1f} ms")
         print(f"{'=' * 60}")
 
 
@@ -202,10 +230,7 @@ class CrossNodeTester(ABC):
             "role": "sender" if self.config.role == "producer" else "receiver",
         }
 
-        if self.config.protocol == "rdma":
-            conn_config["memory_pool_device"] = "cpu"
-        else:
-            conn_config["memory_pool_device"] = f"npu:{self.config.npu_id}"
+        conn_config["memory_pool_device"] = self.config.resolved_pool_device
 
         if self.config.role == "consumer":
             conn_config["sender_host"] = self.config.remote_host
@@ -213,12 +238,23 @@ class CrossNodeTester(ABC):
 
         return conn_config
 
+    def synchronize_cuda(self, timing_name: str, device_id: int | None = None) -> None:
+        """Synchronize the benchmark's CUDA device and record its cost."""
+        if not self.config.requires_cuda:
+            return
+        assert torch is not None
+        started = time.perf_counter()
+        torch.cuda.synchronize(self.config.cuda_device_id if device_id is None else device_id)
+        self.stats.record_timing(timing_name, (time.perf_counter() - started) * 1000)
+
     def initialize(self) -> None:
         assert zmq is not None
         assert YuanrongTransferEngineConnector is not None
         print(f"[{self.role}] Initializing YuanrongTransferEngineConnector...")
+        started = time.perf_counter()
         self.connector = YuanrongTransferEngineConnector(self.get_connector_config())
         self.zmq_ctx = zmq.Context()
+        self.stats.record_timing("Connector initialize", (time.perf_counter() - started) * 1000)
         info = self.connector.get_connection_info()
         print(
             f"[{self.role}] Ready: host={info['host']} "
@@ -257,6 +293,8 @@ class Producer(CrossNodeTester):
         print(f" Remote:       {self.config.remote_host}:{self.config.remote_port}")
         print(f" Control Port: {self.config.ctrl_port}")
         print(f" Pool Size:    {self.config.pool_size_mb} MB")
+        print(f" Pool Device:  {self.config.resolved_pool_device}")
+        print(f" Device Name:  {self.config.device_name}")
         print(f"{'=' * 60}\n")
 
     def setup_control_channel(self) -> None:
@@ -320,10 +358,14 @@ class Producer(CrossNodeTester):
         data, md5, data_size = self.create_test_data(transfer_idx)
         caller_owned_buffer = data if isinstance(data, ManagedBuffer) else None
         t_create = time.perf_counter() - t0
+        self.stats.record_timing("Create payload", t_create * 1000)
+        self.synchronize_cuda("Pre-put CUDA sync", self.config.gpu_id)
 
         t1 = time.perf_counter()
         success, size, _metadata = self.connector.put("producer", "consumer", req_id, data)
         t_put = time.perf_counter() - t1
+        self.stats.record_timing("Connector put", t_put * 1000)
+        self.synchronize_cuda("Post-put CUDA sync")
         if not success:
             self.stats.fail_count += 1
             if caller_owned_buffer is not None:
@@ -338,7 +380,9 @@ class Producer(CrossNodeTester):
             print(f"  Create time: {t_create * 1000:.1f} ms")
             print(f"  [OK] Put registered, {size} bytes ({t_put * 1000:.1f} ms)")
 
+        t_ready = time.perf_counter()
         msg = _recv_ctrl(self.ctrl_socket)
+        self.stats.record_timing("Wait for consumer READY", (time.perf_counter() - t_ready) * 1000)
         if msg.msg_type != "READY":
             self.stats.fail_count += 1
             self.connector.cleanup(req_id, "producer", "consumer")
@@ -349,9 +393,10 @@ class Producer(CrossNodeTester):
 
         _send_ctrl(self.ctrl_socket, CtrlMsg(msg_type="TRANSFER", request_id=req_id, md5=md5, data_size=data_size))
 
-        t2 = time.time()
+        t2 = time.perf_counter()
         response = _recv_ctrl(self.ctrl_socket)
-        t_get = time.time() - t2
+        t_get = time.perf_counter() - t2
+        self.stats.record_timing("Consumer round trip", t_get * 1000)
         ok = response.msg_type == "ACK"
         if ok:
             if not self.config.benchmark:
@@ -363,9 +408,11 @@ class Producer(CrossNodeTester):
             self.stats.fail_count += 1
 
         _send_ctrl(self.ctrl_socket, CtrlMsg(msg_type="ACK"))
+        t_cleanup = time.perf_counter()
         self.connector.cleanup(req_id, "producer", "consumer")
         if caller_owned_buffer is not None:
             caller_owned_buffer.release()
+        self.stats.record_timing("Producer cleanup", (time.perf_counter() - t_cleanup) * 1000)
         return ok
 
     def run(self) -> None:
@@ -408,6 +455,8 @@ class Consumer(CrossNodeTester):
         print(f" Remote:       {self.config.remote_host}:{self.config.remote_port}")
         print(f" Control Port: {self.config.ctrl_port}")
         print(f" Pool Size:    {self.config.pool_size_mb} MB")
+        print(f" Pool Device:  {self.config.resolved_pool_device}")
+        print(f" Device Name:  {self.config.device_name}")
         print(f"{'=' * 60}\n")
 
     def setup_control_channel(self) -> None:
@@ -435,8 +484,10 @@ class Consumer(CrossNodeTester):
         if not self.config.benchmark:
             print(f"\n[CONSUMER] Transfer {transfer_idx + 1}/{self.config.num_transfers}")
 
+        t_wait = time.perf_counter()
         _send_ctrl(self.ctrl_socket, CtrlMsg(msg_type="READY"))
         msg = _recv_ctrl(self.ctrl_socket)
+        self.stats.record_timing("Wait for producer TRANSFER", (time.perf_counter() - t_wait) * 1000)
         if msg.msg_type == "DONE":
             print("[CONSUMER] Producer signaled completion")
             return False
@@ -448,7 +499,7 @@ class Consumer(CrossNodeTester):
         result = self.connector.get("producer", "consumer", msg.request_id, metadata=None)
         t_get = time.perf_counter() - t0
         t_get_ms = t_get * 1000
-        self.stats.record_get(t_get_ms)
+        self.stats.record_timing("Connector get", t_get_ms)
         if self.config.benchmark:
             print(f"[YR SCRIPT GET] {msg.request_id}: get={t_get_ms:.1f}ms")
         response = CtrlMsg(msg_type="ERROR", error="Get failed")
@@ -462,12 +513,15 @@ class Consumer(CrossNodeTester):
                 print(f"  [OK] Get successful, {recv_size} bytes ({t_get_ms:.1f} ms)")
 
             try:
+                self.synchronize_cuda("Post-get CUDA sync")
                 if self.config.benchmark or not msg.md5:
                     response = CtrlMsg(msg_type="ACK")
                     self.stats.success_count += 1
                     self.stats.total_bytes += recv_size
                 else:
+                    t_checksum = time.perf_counter()
                     recv_md5 = compute_md5(recv_buffer)
+                    self.stats.record_timing("Checksum", (time.perf_counter() - t_checksum) * 1000)
                     print(f"  MD5: {recv_md5[:16]}...")
                     if recv_md5 == msg.md5:
                         print("  [PASS] MD5 checksum verified.")
@@ -483,7 +537,9 @@ class Consumer(CrossNodeTester):
                     recv_buffer.release()
 
         _send_ctrl(self.ctrl_socket, response)
+        t_ack = time.perf_counter()
         self.ctrl_socket.recv()
+        self.stats.record_timing("Wait for producer ACK", (time.perf_counter() - t_ack) * 1000)
         return response.msg_type == "ACK"
 
     def run(self) -> None:
@@ -528,8 +584,17 @@ Examples:
   # CPU RDMA zero-copy pool mode:
   python cross_node_yuanrong_transfer_engine.py --role producer ... --mode zerocopy
 
+  # CUDA GPUDirect RDMA mode (use the same options on both nodes):
+  python cross_node_yuanrong_transfer_engine.py --role producer ... \
+      --protocol rdma --mode gpu --gpu-id 0 --memory-pool-device cuda
+
+  # CUDA pool without an extra source-tensor copy:
+  python cross_node_yuanrong_transfer_engine.py --role producer ... \
+      --protocol rdma --mode zerocopy --memory-pool-device cuda:0
+
   # Ascend/NPU mode:
-  python cross_node_yuanrong_transfer_engine.py --role producer ... --protocol ascend --mode npu --npu-id 0 --device-name auto
+  python cross_node_yuanrong_transfer_engine.py --role producer ... \
+      --protocol ascend --mode npu --npu-id 0 --device-name auto
         """,
     )
     parser.add_argument("--role", required=True, choices=["producer", "consumer"])
@@ -549,7 +614,10 @@ Examples:
         "--mode",
         choices=["copy", "zerocopy", "gpu", "npu"],
         default="copy",
-        help="copy/zerocopy use connector pool; gpu is CUDA source tensor; npu uses Ascend pool",
+        help=(
+            "copy/zerocopy use connector pool; gpu uses a CUDA source tensor "
+            "and CUDA pool by default; npu uses Ascend pool"
+        ),
     )
     parser.add_argument("--benchmark", action="store_true", help="skip random data generation and MD5 verification")
     parser.add_argument("--pool-size-mb", type=int, default=512)
@@ -557,6 +625,11 @@ Examples:
     parser.add_argument("--device-name", default="auto")
     parser.add_argument("--gpu-id", type=int, default=0)
     parser.add_argument("--npu-id", type=int, default=0)
+    parser.add_argument(
+        "--memory-pool-device",
+        default="auto",
+        help="RDMA pool device: auto, cpu, cuda, or cuda:N; auto selects cuda:<gpu-id> for gpu mode and cpu otherwise",
+    )
     args = parser.parse_args()
 
     if args.num_transfers <= 0:
@@ -565,10 +638,21 @@ Examples:
         parser.error("--tensor-size-mb must be positive")
     if args.pool_size_mb <= args.tensor_size_mb:
         parser.error("--pool-size-mb must be larger than --tensor-size-mb")
+    if args.gpu_id < 0:
+        parser.error("--gpu-id must be non-negative")
+    if args.npu_id < 0:
+        parser.error("--npu-id must be non-negative")
     if args.protocol == "rdma" and args.mode == "npu":
         parser.error("--mode npu requires --protocol ascend")
     if args.protocol == "ascend" and args.mode in {"copy", "zerocopy"}:
         parser.error("--protocol ascend requires --mode npu")
+    pool_device = str(args.memory_pool_device).strip().lower()
+    if pool_device not in {"", "auto", "cpu", "cuda"} and not (
+        pool_device.startswith("cuda:") and pool_device[5:].isdigit()
+    ):
+        parser.error("--memory-pool-device must be auto, cpu, cuda, or cuda:N")
+    if args.protocol == "ascend" and pool_device not in {"", "auto", "npu"} and not pool_device.startswith("npu:"):
+        parser.error("--memory-pool-device is only applicable to RDMA; Ascend mode uses the NPU pool")
     return TransferConfig(
         role=args.role,
         local_host=args.local_host,
@@ -586,6 +670,7 @@ Examples:
         device_name=args.device_name,
         gpu_id=args.gpu_id,
         npu_id=args.npu_id,
+        memory_pool_device=pool_device,
     )
 
 
@@ -604,13 +689,20 @@ def main() -> int:
         return 1
 
     assert torch is not None
-    if config.mode == "gpu":
+    if config.requires_cuda:
         if not torch.cuda.is_available():
-            print("[ERROR] --mode gpu requires CUDA.")
+            print("[ERROR] The selected source/pool configuration requires CUDA.")
             return 1
-        if config.gpu_id >= torch.cuda.device_count():
-            print(f"[ERROR] --gpu-id {config.gpu_id} is not available.")
-            return 1
+        required_gpu_ids = {config.cuda_device_id}
+        if config.mode == "gpu":
+            required_gpu_ids.add(config.gpu_id)
+        device_count = torch.cuda.device_count()
+        for gpu_id in sorted(required_gpu_ids):
+            if gpu_id >= device_count:
+                print(f"[ERROR] GPU {gpu_id} is not available; found {device_count} GPUs.")
+                return 1
+        print(f"[INFO] CUDA pool: {config.resolved_pool_device}")
+        print(f"[INFO] CUDA device: {torch.cuda.get_device_name(config.cuda_device_id)}")
 
     runner: CrossNodeTester
     if config.role == "producer":

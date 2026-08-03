@@ -66,7 +66,20 @@ class QueryResponse:
     lengths: list[int]
 
 
-def _resolve_device_name(configured_device: Any, protocol: str) -> str:
+def _normalize_cuda_device(device: str) -> str:
+    """Return a concrete CUDA device name suitable for TransferEngine."""
+    device = str(device).strip().lower()
+    if device == "cuda":
+        return f"cuda:{get_connector_local_rank()}"
+    if device.startswith("cuda:") and device[5:].isdigit():
+        return f"cuda:{int(device[5:])}"
+    raise ValueError(
+        "YuanrongTransferEngineConnector CUDA memory_pool_device must be 'cuda' "
+        f"or 'cuda:<device_id>'. Got {device!r}."
+    )
+
+
+def _resolve_device_name(configured_device: Any, protocol: str, pool_device: str | None = None) -> str:
     protocol = str(protocol).strip().lower()
     device_name = str(expand_env_value(configured_device or "auto")).strip()
     if device_name.lower() not in AUTO_DEVICE_VALUES:
@@ -74,6 +87,8 @@ def _resolve_device_name(configured_device: Any, protocol: str) -> str:
     if protocol.lower() in {"ascend", "hccl", "npu"}:
         return f"npu:{get_connector_local_rank()}"
     if protocol == "rdma":
+        if pool_device is not None and str(pool_device).lower().startswith("cuda:"):
+            return str(pool_device)
         return "cpu:*"
     return ""
 
@@ -87,8 +102,10 @@ def _resolve_pool_device(configured_device: Any, protocol: str) -> str:
     if protocol == "rdma":
         if pool_device == "cpu":
             return pool_device
+        if pool_device == "cuda" or pool_device.startswith("cuda:"):
+            return _normalize_cuda_device(pool_device)
         raise ValueError(
-            "YuanrongTransferEngineConnector with protocol='rdma' requires a CPU memory pool. "
+            "YuanrongTransferEngineConnector with protocol='rdma' requires a CPU or CUDA memory pool. "
             f"Got memory_pool_device={pool_device!r}."
         )
     if not (pool_device == "npu" or pool_device.startswith("npu:")):
@@ -97,6 +114,34 @@ def _resolve_pool_device(configured_device: Any, protocol: str) -> str:
             f"Got memory_pool_device={pool_device!r}."
         )
     return pool_device
+
+
+def _validate_device_and_pool(device_name: str, pool_device: str, protocol: str) -> None:
+    """Ensure the registered pool and TransferEngine endpoint use one device kind."""
+    protocol = str(protocol).strip().lower()
+    device_name = str(device_name).strip().lower()
+    pool_device = str(pool_device).strip().lower()
+    device_kind, separator, device_id = device_name.partition(":")
+    pool_kind, _, pool_id = pool_device.partition(":")
+
+    if protocol == "rdma":
+        if device_kind != pool_kind or device_kind not in {"cpu", "cuda"}:
+            raise ValueError(
+                "YuanrongTransferEngineConnector RDMA endpoint and memory pool must use the same "
+                f"device kind. Got device_name={device_name!r}, memory_pool_device={pool_device!r}."
+            )
+        if device_kind == "cuda" and (not separator or not device_id.isdigit() or device_id != pool_id):
+            raise ValueError(
+                "YuanrongTransferEngineConnector CUDA RDMA endpoint must match the CUDA memory pool. "
+                f"Got device_name={device_name!r}, memory_pool_device={pool_device!r}."
+            )
+        return
+
+    if protocol in {"ascend", "hccl", "npu"} and pool_kind != "npu":
+        raise ValueError(
+            "YuanrongTransferEngineConnector Ascend/NPU endpoint requires an NPU memory pool. "
+            f"Got device_name={device_name!r}, memory_pool_device={pool_device!r}."
+        )
 
 
 def _requires_ascend_runtime(protocol: str, pool_device: str) -> bool:
@@ -152,9 +197,10 @@ class YuanrongTransferEngineConnector(OmniConnectorBase):
         self.zmq_port = self._resolve_port(config.get("zmq_port"), self.host, "zmq_port")
         self.rpc_port = self._resolve_port(config.get("rpc_port"), self.host, "rpc_port")
         self.protocol = str(config.get("protocol", "ascend")).strip().lower()
-        self.device_name = _resolve_device_name(config.get("device_name", "auto"), self.protocol)
         self.pool_size = int(config.get("memory_pool_size", 1024**3))
         self.pool_device = _resolve_pool_device(config.get("memory_pool_device"), self.protocol)
+        self.device_name = _resolve_device_name(config.get("device_name", "auto"), self.protocol, self.pool_device)
+        _validate_device_and_pool(self.device_name, self.pool_device, self.protocol)
         if _requires_ascend_runtime(self.protocol, self.pool_device):
             _ensure_ascend_runtime_available()
         self.sender_host = config.get("sender_host")

@@ -290,8 +290,11 @@ For CPU RDMA, both nodes need the vLLM-Omni connector runtime dependencies
 (`torch`, `pyzmq`, `msgspec`) plus the Yuanrong TransferEngine Python binding
 available and a working RDMA environment. The connector CPU RDMA path uses a CPU
 memory pool, so use `--protocol rdma` with `--mode copy` or `--mode zerocopy`.
-This path does not require `vllm_ascend`; `vllm_ascend` is only required when
-the connector is configured for Ascend/NPU transfer.
+For CUDA GPUDirect RDMA, use `--mode gpu`; this selects a `cuda:<gpu-id>` pool by
+default. To test a CUDA pool without the extra source-tensor copy, use
+`--mode zerocopy --memory-pool-device cuda:<gpu-id>`. Both nodes must use a
+Yuanrong TransferEngine build with CUDA RDMA enabled. This path does not require
+`vllm_ascend`; `vllm_ascend` is only required for Ascend/NPU transfer.
 
 **On Machine A (Producer) — start first:**
 
@@ -331,8 +334,31 @@ python cross_node_yuanrong_transfer_engine.py \
 ```
 
 Use `--mode zerocopy` on both nodes to allocate the producer payload directly
-from the connector memory pool. Use `--benchmark` on both nodes to skip random
-data generation and MD5 verification.
+from the connector memory pool. For CUDA GPUDirect RDMA, run the following on
+both nodes, changing the host/role arguments as appropriate:
+
+```bash
+python cross_node_yuanrong_transfer_engine.py \
+    --role producer \
+    --local-host <PRODUCER_IP> \
+    --remote-host <CONSUMER_IP> \
+    --local-port 15500 \
+    --remote-port 15500 \
+    --ctrl-port 15501 \
+    --tensor-size-mb 1024 \
+    --pool-size-mb 2048 \
+    --num-transfers 20 \
+    --protocol rdma \
+    --mode gpu \
+    --gpu-id 0 \
+    --memory-pool-device cuda \
+    --benchmark
+```
+
+The summary reports throughput plus average/p50/p95 timings for payload
+creation, connector put/get, control-channel waits, consumer round trip, CUDA
+synchronization, checksum, and cleanup. CUDA synchronization is explicit so
+asynchronous GPU work is included in the reported timings.
 
 Ascend/NPU transfer is exposed through the same script, but it requires a real
 Ascend runtime and HCCN device network:
@@ -371,8 +397,9 @@ Additional Yuanrong script options:
 | `--local-rpc-port` | Local Yuanrong TransferEngine RPC port, or `auto` | `auto` |
 | `--pool-size-mb` | Connector memory pool size in MiB | 512 |
 | `--protocol` | Yuanrong TransferEngine protocol: `rdma` or `ascend` | `rdma` |
-| `--device-name` | Yuanrong TransferEngine device name; `auto` resolves to `cpu:*` for RDMA and local NPU for Ascend | `auto` |
+| `--device-name` | Yuanrong TransferEngine device name; `auto` resolves to the selected local RDMA pool device (`cpu:*` or `cuda:N`) and local NPU for Ascend | `auto` |
 | `--npu-id` | NPU id used for Ascend memory pool mode | 0 |
+| `--memory-pool-device` | RDMA pool device: `auto`, `cpu`, `cuda`, or `cuda:N`; `auto` follows the selected mode | `auto` |
 
 ---
 
