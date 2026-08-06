@@ -37,7 +37,7 @@ import yaml
 MODEL_PATH = "/path/to/BAGEL-7B-MoT"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT_PATH = Path(__file__).resolve()
-BENCH_SCRIPT = REPO_ROOT / "benchmarks/distributed/omni_connectors/bagel_te_bench.py"
+BENCH_SCRIPT = REPO_ROOT / "tests/distributed/omni_connectors/bagel_te_bench.py"
 DEFAULT_RUN_DIR = Path("/tmp/vllm-omni-bagel-cross-node")
 RUN_DIR = DEFAULT_RUN_DIR
 # SSH runs a non-interactive shell, so the remote virtual environment must be
