@@ -2,8 +2,12 @@
 """Two-node BAGEL TransferEngineConnector end-to-end smoke benchmark.
 
 Run this script on the stage-0 machine. It starts stage 1 through SSH, writes
-per-node deploy YAML files under /tmp, submits three concurrent image requests,
-then stops only the process groups created by this run.
+per-node deploy YAML files under the diagnostic run directory, submits three
+concurrent image requests, captures stage/API/system diagnostics, then stops
+only the process groups created by this run.
+
+See docs/design/feature/omni_connectors/run_bagel_yuanrong_two_node.md for
+prerequisites, command examples, collected artifacts, and performance notes.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import socket
 import subprocess
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -31,14 +36,127 @@ import yaml
 MODEL_PATH = "/path/to/BAGEL-7B-MoT"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT_PATH = Path(__file__).resolve()
-BENCH_SCRIPT = SCRIPT_PATH.with_name("bagel_te_bench.py")
-RUN_DIR = Path("/tmp/vllm-omni-bagel-cross-node")
+BENCH_SCRIPT = REPO_ROOT / "benchmarks/distributed/omni_connectors/bagel_te_bench.py"
+DEFAULT_RUN_DIR = Path("/tmp/vllm-omni-bagel-cross-node")
+RUN_DIR = DEFAULT_RUN_DIR
 # SSH runs a non-interactive shell, so the remote virtual environment must be
 # activated explicitly. Override this when the remote checkout uses another
 # location, for example: VLLM_OMNI_REMOTE_VENV=/opt/vllm-omni/.venv.
 REMOTE_VENV = Path(os.environ.get("VLLM_OMNI_REMOTE_VENV", "/app/vllm-omni/.venv"))
 REMOTE_CUDA_HOME = os.environ.get("VLLM_OMNI_REMOTE_CUDA_HOME", "/usr/local/cuda-13.0")
 ERROR_PATTERN = re.compile(r"Traceback|\bERROR\b|\bException\b|\bRuntimeError\b", re.IGNORECASE)
+DEFAULT_LOG_LEVEL = os.environ.get("VLLM_OMNI_DIAGNOSTIC_LOG_LEVEL", "DEBUG").upper()
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+
+
+def _write_command(path: Path, command: list[str]) -> None:
+    path.write_text(shlex.join(command) + "\n", encoding="utf-8")
+
+
+def _run_capture(command: list[str], *, timeout: int = 10) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, text=True, capture_output=True, check=False, timeout=timeout)
+
+
+def _collect_system_info(path: Path, args: argparse.Namespace) -> None:
+    """Collect best-effort host and runtime information without failing the test."""
+    package_probe = (
+        "import importlib.metadata as m, importlib.util, sys; "
+        "print('python:', sys.version.replace('\\n', ' ')); "
+        "names = ('vllm', 'vllm-omni', 'torch', 'pyzmq', 'PyYAML', 'openyuanrong-datasystem'); "
+        "installed = {d.metadata.get('Name', '').lower(): d.version for d in m.distributions()}; "
+        "[print(name + ':', installed.get(name.lower(), 'not-installed')) for name in names]; "
+        "[print('module ' + name + ':', bool(importlib.util.find_spec(name))) for name in ('yr', 'torch', 'vllm', 'vllm_omni')]"
+    )
+    commands: list[tuple[str, list[str]]] = [
+        ("timestamp", ["date", "--iso-8601=seconds"]),
+        ("hostname", ["hostname", "--fqdn"]),
+        ("uname", ["uname", "-a"]),
+        ("python-and-packages", [sys.executable, "-c", package_probe]),
+        ("git-commit", ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"]),
+        ("git-status", ["git", "-C", str(REPO_ROOT), "status", "--short"]),
+        ("gpu-list", ["nvidia-smi", "-L"]),
+        (
+            "gpu-summary",
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,driver_version,memory.total,pci.bus_id",
+                "--format=csv",
+            ],
+        ),
+        ("rdma-devices", ["ibdev2netdev"]),
+        ("rdma-status", ["ibstat"]),
+        ("network-addresses", ["ip", "-br", "addr"]),
+        ("network-routes", ["ip", "route"]),
+        ("npu-smi", ["npu-smi", "info"]),
+        ("hccn-tool-ip", ["hccn_tool", "-i", "0", "-ip", "-g"]),
+        ("hccn-tool-link", ["hccn_tool", "-i", "0", "-link", "-g"]),
+        ("hccn-tool-health", ["hccn_tool", "-i", "0", "-net_health", "-g"]),
+        ("processes", ["ps", "-eo", "pid,ppid,pgid,etime,cmd"]),
+    ]
+    selected_env = (
+        "CUDA_HOME",
+        "CUDA_PATH",
+        "VLLM_LOGGING_LEVEL",
+        "VLLM_OMNI_DIAGNOSTIC_LOG_LEVEL",
+        "VLLM_OMNI_REMOTE_VENV",
+        "VLLM_OMNI_REMOTE_CUDA_HOME",
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as info_file:
+        info_file.write("# Diagnostic system information (best effort)\n")
+        info_file.write(f"# run_dir={RUN_DIR}\n")
+        info_file.write(f"# connector={args.connector}\n")
+        info_file.write(f"# logging_level={args.vllm_logging_level}\n\n")
+        info_file.write("[selected-environment]\n")
+        for name in selected_env:
+            value = (
+                args.vllm_logging_level
+                if name == "VLLM_LOGGING_LEVEL"
+                else os.environ.get(name, "<unset>")
+            )
+            info_file.write(f"{name}={value}\n")
+        info_file.write("\n")
+        for name, command in commands:
+            info_file.write(f"[{name}]\n$ {shlex.join(command)}\n")
+            try:
+                result = _run_capture(command)
+                info_file.write(f"exit_code={result.returncode}\n")
+                if result.stdout:
+                    info_file.write(result.stdout)
+                    if not result.stdout.endswith("\n"):
+                        info_file.write("\n")
+                if result.stderr:
+                    info_file.write("[stderr]\n")
+                    info_file.write(result.stderr)
+                    if not result.stderr.endswith("\n"):
+                        info_file.write("\n")
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                info_file.write(f"unavailable={exc}\n")
+            info_file.write("\n")
+
+
+def _runtime_env(args: argparse.Namespace) -> dict[str, str]:
+    env = os.environ.copy()
+    env["VLLM_LOGGING_LEVEL"] = args.vllm_logging_level
+    return env
+
+
+def _write_run_metadata(args: argparse.Namespace, *, status: str, error: str | None = None) -> None:
+    metadata = {
+        "status": status,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "argv": sys.argv,
+        "args": vars(args),
+        "script": str(SCRIPT_PATH),
+        "repo_root": str(REPO_ROOT),
+        "local_python": sys.executable,
+        "local_pid": os.getpid(),
+        "error": error,
+    }
+    _write_json(RUN_DIR / "run-metadata.json", metadata)
 
 
 def _memory_pool_device_arg(value: str) -> str:
@@ -200,6 +318,8 @@ def _ssh(host: str, command: list[str], *, check: bool = True) -> subprocess.Com
 def _remote_script_command(mode: str, args: argparse.Namespace) -> list[str]:
     return [
         # `_ssh()` activates the remote venv before this command runs.
+        "env",
+        f"VLLM_LOGGING_LEVEL={args.vllm_logging_level}",
         "python",
         str(SCRIPT_PATH),
         mode,
@@ -229,6 +349,10 @@ def _remote_script_command(mode: str, args: argparse.Namespace) -> list[str]:
         str(args.startup_timeout),
         "--request-timeout",
         str(args.request_timeout),
+        "--run-dir",
+        str(args.run_dir),
+        "--vllm-logging-level",
+        args.vllm_logging_level,
     ]
 
 
@@ -259,6 +383,28 @@ def _api_ready(host: str, port: int) -> bool:
         return False
 
 
+def _capture_api_snapshot(args: argparse.Namespace, label: str) -> None:
+    """Save observability endpoints without making endpoint availability fatal."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    endpoints = {
+        "metrics": f"http://{args.stage0_ip}:{args.api_port}/metrics",
+        "health": f"http://{args.stage0_ip}:{args.api_port}/health",
+        "models": f"http://{args.stage0_ip}:{args.api_port}/v1/models",
+    }
+    for name, url in endpoints.items():
+        path = RUN_DIR / f"api-{label}-{name}.txt"
+        try:
+            with opener.open(url, timeout=10) as response:
+                body = response.read().decode("utf-8", errors="replace")
+                path.write_text(
+                    f"url={url}\nstatus={response.status}\n"
+                    f"content_type={response.headers.get('Content-Type', '')}\n\n{body}",
+                    encoding="utf-8",
+                )
+        except (OSError, urllib.error.URLError, TimeoutError) as exc:
+            path.write_text(f"url={url}\nunavailable={exc}\n", encoding="utf-8")
+
+
 def _start_stage0(args: argparse.Namespace) -> subprocess.Popen[Any]:
     deploy_yaml = _write_deploy_yaml(
         0,
@@ -287,8 +433,15 @@ def _start_stage0(args: argparse.Namespace) -> subprocess.Popen[Any]:
         str(deploy_yaml),
         "--log-stats",
     ]
+    _write_command(RUN_DIR / "stage0-command.txt", command)
     log_file = (RUN_DIR / "stage0.log").open("w", encoding="utf-8")
-    process = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True)
+    process = subprocess.Popen(
+        command,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env=_runtime_env(args),
+    )
     log_file.close()
     _write_record(0, process)
     return process
@@ -343,6 +496,7 @@ def _run_bench(args: argparse.Namespace) -> None:
         str(args.request_timeout),
     ]
     with (RUN_DIR / "bench.log").open("w", encoding="utf-8") as log_file:
+        _write_command(RUN_DIR / "bench-command.txt", command)
         result = subprocess.run(command, stdout=log_file, stderr=subprocess.STDOUT)
     if result.returncode:
         raise RuntimeError(f"Bench wrapper failed with status {result.returncode}")
@@ -351,6 +505,30 @@ def _run_bench(args: argparse.Namespace) -> None:
 def _fetch_remote_log(args: argparse.Namespace) -> None:
     result = _ssh(args.stage1_host, ["cat", str(RUN_DIR / "stage1.log")], check=False)
     _append_command_output(RUN_DIR / "stage1.log", result)
+
+
+def _fetch_remote_artifact(args: argparse.Namespace, filename: str) -> None:
+    remote_path = RUN_DIR / filename
+    local_name = f"remote-{filename}"
+    result = _ssh(args.stage1_host, ["cat", str(remote_path)], check=False)
+    if result.returncode == 0:
+        (RUN_DIR / local_name).write_text(result.stdout, encoding="utf-8")
+    else:
+        _append_command_output(RUN_DIR / "controller.log", result)
+        _log(f"Could not fetch remote artifact {remote_path}")
+
+
+def _fetch_remote_artifacts(args: argparse.Namespace) -> None:
+    # Keep local copies even when the remote run directory is purged after a
+    # successful run. These files make the diagnostic bundle self-contained.
+    for filename in (
+        "bagel-stage1.yaml",
+        "stage1-system-info.txt",
+        "stage1.process.json",
+        "controller.log",
+        "stage1-command.txt",
+    ):
+        _fetch_remote_artifact(args, filename)
 
 
 def _cleanup_remote(args: argparse.Namespace, *, purge: bool) -> None:
@@ -389,8 +567,15 @@ def _remote_stage1(args: argparse.Namespace) -> int:
         str(deploy_yaml),
         "--log-stats",
     ]
+    _write_command(RUN_DIR / "stage1-command.txt", command)
     log_file = (RUN_DIR / "stage1.log").open("w", encoding="utf-8")
-    process = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True)
+    process = subprocess.Popen(
+        command,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env=_runtime_env(args),
+    )
     log_file.close()
     _write_record(1, process)
     _log(f"Started stage 1 with pid {process.pid}")
@@ -406,6 +591,11 @@ def _remote_status() -> int:
     return 0
 
 
+def _remote_system_info(args: argparse.Namespace) -> int:
+    _collect_system_info(RUN_DIR / "stage1-system-info.txt", args)
+    return 0
+
+
 def _prepare_local_run() -> None:
     _kill_process_group(_record_path(0))
     shutil.rmtree(RUN_DIR, ignore_errors=True)
@@ -416,35 +606,63 @@ def _run_controller(args: argparse.Namespace) -> int:
     _prepare_local_run()
     controller_log = RUN_DIR / "controller.log"
     controller_log.touch()
+    _write_run_metadata(args, status="running")
     stage0: subprocess.Popen[Any] | None = None
     success = False
+    failure: str | None = None
     try:
         _assert_port_available(args.api_port)
         _assert_port_available(args.omni_master_port)
         _cleanup_remote(args, purge=False)
         _log(f"Artifacts: {RUN_DIR}")
         _log(f"Stage 0 host: {args.stage0_host}; Stage 1 SSH host: {args.stage1_host}")
-        _log(f"Connector: {args.connector}")
+        _log(f"Connector: {args.connector}; VLLM_LOGGING_LEVEL={args.vllm_logging_level}")
+        _log(f"Remote artifacts will be {'kept' if args.keep_artifacts else 'purged after local fetch'}")
+        if not args.skip_system_info:
+            _collect_system_info(RUN_DIR / "stage0-system-info.txt", args)
+            _log("Collecting remote system information")
+            result = _ssh(
+                args.stage1_host,
+                _remote_script_command("--remote-system-info", args),
+                check=False,
+            )
+            _append_command_output(controller_log, result)
+            if result.returncode:
+                _log("Remote system information collection failed; continuing")
         stage0 = _start_stage0(args)
         _start_stage1_remote(args)
         _wait_for_startup(stage0, args)
+        _capture_api_snapshot(args, "startup")
         _run_bench(args)
+        _capture_api_snapshot(args, "after-bench")
         if stage0.poll() is not None or not _remote_alive(args):
             raise RuntimeError("A vLLM stage exited before benchmark completion")
         success = True
         _log("BAGEL TransferEngineConnector benchmark completed successfully")
         return 0
     except Exception as exc:
+        failure = str(exc)
         _log(f"FAILED: {exc}")
         with controller_log.open("a", encoding="utf-8") as log_file:
-            log_file.write(f"FAILED: {exc}\n")
+            log_file.write(traceback.format_exc())
         return 1
     finally:
+        _capture_api_snapshot(args, "final")
         _kill_process_group(_record_path(0))
         _fetch_remote_log(args)
-        _cleanup_remote(args, purge=True)
-        if not success:
-            _log(f"Failure artifacts retained at {RUN_DIR}")
+        _fetch_remote_artifacts(args)
+        # A failed run is always retained for debugging. A successful run is
+        # retained when requested; otherwise only the fetched local bundle is
+        # kept and the remote process directory is removed.
+        _cleanup_remote(args, purge=success and not args.keep_artifacts)
+        if success:
+            if args.keep_artifacts:
+                _log(f"Artifacts retained locally and remotely at {RUN_DIR}")
+            else:
+                _log(f"Local diagnostic artifacts retained at {RUN_DIR}")
+        else:
+            _log(f"Failure artifacts retained locally at {RUN_DIR}")
+        _write_run_metadata(args, status="passed" if success else "failed", error=failure)
 
 
 def parse_args() -> argparse.Namespace:
@@ -467,14 +685,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--omni-master-port", type=int, default=8091)
     parser.add_argument("--startup-timeout", type=int, default=600)
     parser.add_argument("--request-timeout", type=int, default=600)
+    parser.add_argument(
+        "--run-dir",
+        default=str(DEFAULT_RUN_DIR),
+        help="Local and remote diagnostic directory; use a unique path to retain multiple runs",
+    )
+    parser.add_argument(
+        "--vllm-logging-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default=DEFAULT_LOG_LEVEL if DEFAULT_LOG_LEVEL in {"DEBUG", "INFO", "WARNING", "ERROR"} else "DEBUG",
+        help="VLLM_LOGGING_LEVEL for both vLLM stages (DEBUG captures connector details)",
+    )
+    parser.add_argument(
+        "--skip-system-info",
+        action="store_true",
+        help="Skip best-effort GPU/RDMA/network/runtime snapshots",
+    )
+    parser.add_argument(
+        "--keep-artifacts",
+        action="store_true",
+        help="Keep the remote diagnostic directory after the run; local copies are always kept",
+    )
     parser.add_argument("--remote-stage1", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--remote-status", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--remote-cleanup", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--remote-system-info", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
 def main() -> int:
+    global RUN_DIR
     args = parse_args()
+    RUN_DIR = Path(args.run_dir).expanduser()
+    if not RUN_DIR.is_absolute():
+        RUN_DIR = Path.cwd() / RUN_DIR
+    RUN_DIR = RUN_DIR.resolve()
+    args.run_dir = str(RUN_DIR)
     if args.remote_stage1:
         return _remote_stage1(args)
     if args.remote_status:
@@ -482,6 +728,8 @@ def main() -> int:
     if args.remote_cleanup:
         _kill_process_group(_record_path(1))
         return 0
+    if args.remote_system_info:
+        return _remote_system_info(args)
     return _run_controller(args)
 
 
