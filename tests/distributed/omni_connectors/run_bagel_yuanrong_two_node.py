@@ -21,6 +21,7 @@ import shlex
 import shutil
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import time
@@ -46,6 +47,16 @@ REMOTE_VENV = Path(os.environ.get("VLLM_OMNI_REMOTE_VENV", "/app/vllm-omni/.venv
 REMOTE_CUDA_HOME = os.environ.get("VLLM_OMNI_REMOTE_CUDA_HOME", "/usr/local/cuda-13.0")
 ERROR_PATTERN = re.compile(r"Traceback|\bERROR\b|\bException\b|\bRuntimeError\b", re.IGNORECASE)
 DEFAULT_LOG_LEVEL = os.environ.get("VLLM_OMNI_DIAGNOSTIC_LOG_LEVEL", "DEBUG").upper()
+YR_GET_PATTERN = re.compile(
+    r"\[YR GET\]\s+(?P<key>[^:]+):\s+"
+    r"(?:size_bytes=(?P<size_bytes>\d+),\s+)?"
+    r"query=(?P<query_ms>[\d.]+)ms,\s+"
+    r"alloc=(?P<alloc_ms>[\d.]+)ms,\s+"
+    r"read=(?P<read_ms>[\d.]+)ms,\s+"
+    r"(?:copy=(?P<copy_ms>[\d.]+)ms,\s+)?"
+    r"total=(?P<total_ms>[\d.]+)ms,\s+"
+    r"(?P<mbps>[\d.]+)\s+MB/s(?:\s+\((?P<flags>[^)]*)\))?"
+)
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -145,6 +156,7 @@ def _runtime_env(args: argparse.Namespace) -> dict[str, str]:
 
 
 def _write_run_metadata(args: argparse.Namespace, *, status: str, error: str | None = None) -> None:
+    git_result = _run_capture(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"])
     metadata = {
         "status": status,
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -152,11 +164,220 @@ def _write_run_metadata(args: argparse.Namespace, *, status: str, error: str | N
         "args": vars(args),
         "script": str(SCRIPT_PATH),
         "repo_root": str(REPO_ROOT),
+        "git_commit": git_result.stdout.strip() if git_result.returncode == 0 else "unknown",
         "local_python": sys.executable,
         "local_pid": os.getpid(),
         "error": error,
     }
     _write_json(RUN_DIR / "run-metadata.json", metadata)
+
+
+def _parse_yr_get_log(path: Path) -> list[dict[str, Any]]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+
+    records: list[dict[str, Any]] = []
+    for match in YR_GET_PATTERN.finditer(text):
+        size_bytes = match.group("size_bytes")
+        total_ms = float(match.group("total_ms"))
+        mbps = float(match.group("mbps"))
+        record: dict[str, Any] = {
+            "key": match.group("key"),
+            "size_bytes": int(size_bytes) if size_bytes is not None else None,
+            "query_ms": float(match.group("query_ms")),
+            "alloc_ms": float(match.group("alloc_ms")),
+            "read_ms": float(match.group("read_ms")),
+            "copy_ms": float(match.group("copy_ms")) if match.group("copy_ms") else None,
+            "total_ms": total_ms,
+            "mbps": mbps,
+            "fast_path": "fast_path" in (match.group("flags") or ""),
+        }
+        # Old logs did not include size_bytes. Keep the result useful, but
+        # explicitly mark the value as estimated because MB/s and total_ms
+        # are rounded to one decimal place in the log.
+        if record["size_bytes"] is None:
+            record["size_bytes_estimate"] = mbps * (total_ms / 1000.0) * 1024**2
+        records.append(record)
+    return records
+
+
+def _find_metric_value(text: str, metric_name: str, required_labels: tuple[str, ...] = ()) -> float | None:
+    value_pattern = re.compile(r"\s([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*$")
+    for line in text.splitlines():
+        if not line.startswith(metric_name):
+            continue
+        if any(label not in line for label in required_labels):
+            continue
+        match = value_pattern.search(line)
+        if match:
+            return float(match.group(1))
+    return None
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _format_stat(values: list[float], unit: str = "ms") -> str:
+    if not values:
+        return "n/a"
+    return (
+        f"avg={statistics.fmean(values):.2f}{unit}, "
+        f"min={min(values):.2f}{unit}, max={max(values):.2f}{unit}"
+    )
+
+
+def _write_transfer_summary(args: argparse.Namespace, *, success: bool, failure: str | None) -> None:
+    """Write a concise PR-ready summary from logs and Prometheus snapshots."""
+    records = _parse_yr_get_log(RUN_DIR / "stage1.log")
+    bench = _load_json(RUN_DIR / "images" / "bench-result.json")
+    metrics_path = RUN_DIR / "api-after-bench-metrics.txt"
+    try:
+        metrics_text = metrics_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        metrics_text = ""
+
+    sizes_are_exact = bool(records) and all(record["size_bytes"] is not None for record in records)
+    size_values = [
+        float(record["size_bytes"])
+        if record["size_bytes"] is not None
+        else float(record["size_bytes_estimate"])
+        for record in records
+    ]
+    total_bytes = sum(size_values)
+    total_read_ms = sum(float(record["read_ms"]) for record in records)
+    total_total_ms = sum(float(record["total_ms"]) for record in records)
+    total_query_ms = [float(record["query_ms"]) for record in records]
+    total_alloc_ms = [float(record["alloc_ms"]) for record in records]
+    total_copy_ms = [float(record["copy_ms"]) for record in records if record["copy_ms"] is not None]
+    total_overhead_ms = [float(record["total_ms"]) - float(record["read_ms"]) for record in records]
+    fast_path_count = sum(1 for record in records if record["fast_path"])
+
+    transfer_count = _find_metric_value(
+        metrics_text,
+        "vllm_omni:transfer_size_bytes_count",
+        ('from_stage="0"', 'to_stage="1"'),
+    )
+    transfer_size_sum = _find_metric_value(
+        metrics_text,
+        "vllm_omni:transfer_size_bytes_sum",
+        ('from_stage="0"', 'to_stage="1"'),
+    )
+    tx_count = _find_metric_value(
+        metrics_text,
+        "vllm_omni:transfer_tx_s_count",
+        ('from_stage="0"', 'to_stage="1"'),
+    )
+    tx_sum_s = _find_metric_value(
+        metrics_text,
+        "vllm_omni:transfer_tx_s_sum",
+        ('from_stage="0"', 'to_stage="1"'),
+    )
+    rx_count = _find_metric_value(
+        metrics_text,
+        "vllm_omni:transfer_rx_s_count",
+        ('from_stage="0"', 'to_stage="1"'),
+    )
+    in_flight_count = _find_metric_value(
+        metrics_text,
+        "vllm_omni:transfer_in_flight_s_count",
+        ('from_stage="0"', 'to_stage="1"'),
+    )
+    http_count = _find_metric_value(
+        metrics_text,
+        "http_requests_total",
+        ('handler="/v1/chat/completions"', 'status="2xx"'),
+    )
+    http_duration_sum_s = _find_metric_value(
+        metrics_text,
+        "http_request_duration_seconds_sum",
+        ('handler="/v1/chat/completions"', 'method="POST"'),
+    )
+
+    lines = [
+        "# Yuanrong TransferEngine benchmark summary",
+        "",
+        f"- Result: **{'PASS' if success else 'FAIL'}**",
+        f"- Connector: `{args.connector}`",
+        f"- Model: `{args.model}`",
+        f"- Edge: stage `{args.stage0_host}` (`{args.stage0_ip}`) -> stage `{args.stage1_host}` (`{args.stage1_ip}`)",
+        f"- Source commit: see `run-metadata.json`",
+    ]
+    if failure:
+        lines.append(f"- Failure: `{failure}`")
+
+    lines.extend(
+        [
+            "",
+            "## Request result",
+            "",
+            f"- HTTP chat requests: `{int(http_count) if http_count is not None else bench.get('successful_requests', 'n/a')}` succeeded",
+            f"- Benchmark requests: `{bench.get('successful_requests', 'n/a')}/{bench.get('request_count', 'n/a')}`",
+            f"- Benchmark wall time: `{bench.get('wall_time_seconds', 'n/a')} s`",
+            f"- Image throughput: `{bench.get('image_throughput_per_second', 'n/a')} requests/s`",
+            f"- HTTP chat duration: `{http_duration_sum_s:.3f} s` total" if http_duration_sum_s is not None else "- HTTP chat duration: `n/a`",
+            "",
+            "## Connector receive result",
+            "",
+            f"- Connector receives observed: `{len(records)}`",
+            f"- Payload transferred: `{total_bytes / 1024**2:.3f} MiB` ({'exact' if sizes_are_exact else 'estimated from rounded log values'})",
+            f"- Fast path / zero-copy: `{fast_path_count}/{len(records)}`",
+            f"- Query: `{_format_stat(total_query_ms)}`",
+            f"- Allocation: `{_format_stat(total_alloc_ms)}`",
+            f"- Transfer read + device sync: `{_format_stat([float(record['read_ms']) for record in records])}`",
+            f"- Copy to host/deserialize: `{_format_stat(total_copy_ms) if total_copy_ms else 'n/a (fast path)'}`",
+            f"- Post-read overhead (`total - read`): `{_format_stat(total_overhead_ms)}`",
+            f"- Total connector receive time: `{total_total_ms:.2f} ms`",
+            f"- Effective end-to-end throughput: `{total_bytes / 1024**2 / (total_total_ms / 1000.0):.2f} MiB/s`" if total_total_ms > 0 else "- Effective end-to-end throughput: `n/a`",
+            f"- Read-path throughput: `{total_bytes / 1024**2 / (total_read_ms / 1000.0):.2f} MiB/s`" if total_read_ms > 0 else "- Read-path throughput: `n/a`",
+            "",
+            "## Per-transfer details",
+            "",
+            "| # | Size | Query | Alloc | Read | Total | Throughput | Path |",
+            "|---:|---:|---:|---:|---:|---:|---:|---|",
+        ]
+    )
+    for index, record in enumerate(records, start=1):
+        size = record.get("size_bytes")
+        size_text = f"{size / 1024**2:.3f} MiB" if size is not None else f"~{record['size_bytes_estimate'] / 1024**2:.3f} MiB"
+        lines.append(
+            f"| {index} | {size_text} | {record['query_ms']:.1f} ms | {record['alloc_ms']:.1f} ms | "
+            f"{record['read_ms']:.1f} ms | {record['total_ms']:.1f} ms | {record['mbps']:.1f} MB/s | "
+            f"{'fast/zero-copy' if record['fast_path'] else 'copy'} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Prometheus transfer instrumentation",
+            "",
+            f"- `transfer_size_bytes`: count=`{transfer_count if transfer_count is not None else 'missing'}`, sum=`{transfer_size_sum if transfer_size_sum is not None else 'missing'}` bytes",
+            f"- `transfer_tx_s`: count=`{tx_count if tx_count is not None else 'missing'}`, sum=`{tx_sum_s * 1000:.3f} ms`" if tx_sum_s is not None else "- `transfer_tx_s`: missing",
+            f"- `transfer_rx_s`: count=`{rx_count if rx_count is not None else 'missing'}`",
+            f"- `transfer_in_flight_s`: count=`{in_flight_count if in_flight_count is not None else 'missing'}`",
+        ]
+    )
+    if records and transfer_size_sum == 0:
+        lines.append("- Note: connector logs report non-zero payloads, but the generic `transfer_size_bytes` emitter recorded zero; do not use that Prometheus sum as the payload size.")
+    if records and rx_count is None:
+        lines.append("- Note: RX/in-flight histogram samples were not emitted for this run; use `[YR GET]` read timing until the receive-side metrics hook is fixed.")
+    lines.extend(
+        [
+            "",
+            "## Evidence",
+            "",
+            "- Connector log: `stage1.log`",
+            "- Request result: `images/bench-result.json`",
+            "- Prometheus snapshot: `api-after-bench-metrics.txt`",
+        ]
+    )
+    (RUN_DIR / "transfer-summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _memory_pool_device_arg(value: str) -> str:
@@ -651,6 +872,11 @@ def _run_controller(args: argparse.Namespace) -> int:
         _kill_process_group(_record_path(0))
         _fetch_remote_log(args)
         _fetch_remote_artifacts(args)
+        try:
+            _write_transfer_summary(args, success=success, failure=failure)
+            _log(f"Transfer summary: {RUN_DIR / 'transfer-summary.md'}")
+        except Exception as summary_exc:
+            _log(f"Could not write transfer summary: {summary_exc}")
         # A failed run is always retained for debugging. A successful run is
         # retained when requested; otherwise only the fetched local bundle is
         # kept and the remote process directory is removed.

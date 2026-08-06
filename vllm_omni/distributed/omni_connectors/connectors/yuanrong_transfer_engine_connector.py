@@ -667,9 +667,10 @@ class YuanrongTransferEngineConnector(OmniConnectorBase):
                 total_ms = (_time_mod.perf_counter() - t0) * 1000
                 mbps = (data_size / 1024 / 1024) / (total_ms / 1000) if total_ms > 0 else 0
                 logger.info(
-                    "[YR GET] %s: query=%.1fms, alloc=%.1fms, read=%.1fms, total=%.1fms, %.1f MB/s "
+                    "[YR GET] %s: size_bytes=%d, query=%.1fms, alloc=%.1fms, read=%.1fms, total=%.1fms, %.1f MB/s "
                     "(fast_path, zero-copy)",
                     get_key,
+                    data_size,
                     query_ms,
                     alloc_ms,
                     read_ms,
@@ -689,8 +690,9 @@ class YuanrongTransferEngineConnector(OmniConnectorBase):
                 total_ms = (end - t0) * 1000
                 mbps = (data_size / 1024 / 1024) / (total_ms / 1000) if total_ms > 0 else 0
                 logger.info(
-                    "[YR GET] %s: query=%.1fms, alloc=%.1fms, read=%.1fms, copy=%.1fms, total=%.1fms, %.1f MB/s",
+                    "[YR GET] %s: size_bytes=%d, query=%.1fms, alloc=%.1fms, read=%.1fms, copy=%.1fms, total=%.1fms, %.1f MB/s",
                     get_key,
+                    data_size,
                     query_ms,
                     alloc_ms,
                     read_ms,

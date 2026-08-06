@@ -99,7 +99,8 @@ The local run directory contains the following groups of artifacts:
 - `stage0-system-info.txt` and `remote-stage1-system-info.txt`: best-effort
   host, Python/package, GPU, RDMA, network, route, and process snapshots;
 - `api-startup-*`, `api-after-bench-*`, and `api-final-*`: raw responses from
-  `/metrics`, `/health`, and `/v1/models`; and
+  `/metrics`, `/health`, and `/v1/models`;
+- `transfer-summary.md`: the concise PR-ready summary generated after the run;
 - `images/`: raw request responses, generated PNGs, and `bench-result.json`.
 
 Before sharing the bundle, redact model paths, hostnames, IP addresses,
@@ -110,22 +111,52 @@ logs. Do not share raw logs blindly with a public issue or PR.
 
 Start with these files:
 
-1. `run-metadata.json` confirms the exact source and options used.
-2. `stage0.log` and `stage1.log` contain the connector and stage lifecycle.
-3. Search both logs for `[YR GET]`, `transfer_engine`, `cleanup`, `Pool`, and
+1. `transfer-summary.md` gives the PR-ready result and flags missing metrics.
+2. `run-metadata.json` confirms the exact source and options used.
+3. `stage0.log` and `stage1.log` contain the connector and stage lifecycle.
+4. Search both logs for `[YR GET]`, `transfer_engine`, `cleanup`, `Pool`, and
    `ERROR`.
-4. Compare the `[YR GET]` `query`, `alloc`, `read`, `copy`, `total`, and
+5. Compare the `[YR GET]` `query`, `alloc`, `read`, `copy`, `total`, and
    `MB/s` fields with `bench-result.json`.
-5. Compare `api-startup-metrics.txt` with
+6. Compare `api-startup-metrics.txt` with
    `api-after-bench-metrics.txt` for aggregate transfer counters.
-6. Use the two system-info files to correlate the result with RDMA device,
+7. Use the two system-info files to correlate the result with RDMA device,
    link, route, driver, and package versions.
 
+The most relevant Prometheus families for cross-stage transfer are:
+
+```text
+vllm_omni:transfer_size_bytes_*
+vllm_omni:transfer_tx_s_*
+vllm_omni:transfer_rx_s_*
+vllm_omni:transfer_in_flight_s_*
+```
+
+For a successful `0 -> 1` transfer, inspect the corresponding `_count` and
+`_sum` series and require a positive count and size. The labels identify
+`from_stage`, `from_replica`, `to_stage`, and `to_replica`. For example:
+
+```bash
+grep -E 'vllm_omni:transfer_(size_bytes|tx_s|rx_s|in_flight_s)' \
+  api-after-bench-metrics.txt
+```
+
+`request_prefill_kv_computed_tokens_*` is a prefill-token histogram. A zero
+value for stage 1 can be expected when stage 1 does not perform prefill; it is
+not, by itself, evidence that Yuanrong was bypassed. Confirm the connector
+path with the generated YAML and the `[YR GET]` lines in `stage1.log`.
+
+The three most useful request-side values in `images/bench-result.json` are
+`successful_requests`, `wall_time_seconds`, and each result's
+`latency_seconds`; `image_throughput_per_second` is only a smoke-test metric
+because the default workload contains three requests.
+
 The current connector's successful receive log is emitted after the
-TransferEngine read and device synchronization. Therefore `read` is closer to
-the actual read/synchronization portion, while `total` includes metadata and
-post-read handling. A successful sender `put()` is not proof that the receiver
-completed its read; correlate the sender and receiver logs by request key.
+TransferEngine read and device synchronization and includes `size_bytes`.
+Therefore `read` is closer to the actual read/synchronization portion, while
+`total` includes metadata and post-read handling. A successful sender `put()`
+is not proof that the receiver completed its read; correlate the sender and
+receiver logs by request key.
 
 ## Failure handling and cleanup
 
