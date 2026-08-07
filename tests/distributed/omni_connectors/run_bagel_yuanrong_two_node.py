@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Two-node BAGEL TransferEngineConnector end-to-end smoke benchmark.
+"""Two-stage BAGEL connector end-to-end smoke benchmark.
 
 Run this script on the stage-0 machine. It starts stage 1 through SSH, writes
 per-node deploy YAML files under the diagnostic run directory, submits three
 concurrent image requests, captures stage/API/system diagnostics, then stops
-only the process groups created by this run.
+only the process groups created by this run. Use ``--connector shared_memory``
+for a same-node non-RDMA baseline; the two stages must then run on one host.
 
 See docs/design/feature/omni_connectors/run_bagel_yuanrong_two_node.md for
 prerequisites, command examples, collected artifacts, and performance notes.
@@ -37,7 +38,7 @@ import yaml
 MODEL_PATH = "/path/to/BAGEL-7B-MoT"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT_PATH = Path(__file__).resolve()
-BENCH_SCRIPT = REPO_ROOT / "tests/distributed/omni_connectors/bagel_te_bench.py"
+BENCH_SCRIPT = REPO_ROOT / "benchmarks/distributed/omni_connectors/bagel_te_bench.py"
 DEFAULT_RUN_DIR = Path("/tmp/vllm-omni-bagel-cross-node")
 RUN_DIR = DEFAULT_RUN_DIR
 # SSH runs a non-interactive shell, so the remote virtual environment must be
@@ -322,6 +323,32 @@ def _write_transfer_summary(args: argparse.Namespace, *, success: bool, failure:
             f"- Benchmark wall time: `{bench.get('wall_time_seconds', 'n/a')} s`",
             f"- Image throughput: `{bench.get('image_throughput_per_second', 'n/a')} requests/s`",
             f"- HTTP chat duration: `{http_duration_sum_s:.3f} s` total" if http_duration_sum_s is not None else "- HTTP chat duration: `n/a`",
+        ]
+    )
+
+    if args.connector == "shared_memory":
+        lines.extend(
+            [
+                "",
+                "## Shared-memory baseline",
+                "",
+                "- Connector: `SharedMemoryConnector`",
+                "- Cross-node RDMA transfer metrics: `not applicable`",
+                "- Yuanrong `[YR GET]` records: `not applicable`",
+                "- Note: this mode is a same-node baseline and must not be used as a cross-node transport result.",
+                "",
+                "## Evidence",
+                "",
+                "- Request result: `images/bench-result.json`",
+                "- Stage logs: `stage0.log` and `stage1.log`",
+                "- Deploy configurations: `bagel-stage0.yaml` and `remote-bagel-stage1.yaml`",
+            ]
+        )
+        (RUN_DIR / "transfer-summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return
+
+    lines.extend(
+        [
             "",
             "## Connector receive result",
             "",
@@ -445,6 +472,9 @@ def _connector_config(
     memory_pool_device: str,
     memory_pool_size: int,
 ) -> dict[str, Any]:
+    if connector == "shared_memory":
+        return {"name": "SharedMemoryConnector"}
+
     extra: dict[str, Any] = {
         "host": host,
         "zmq_port": 50051,
@@ -896,9 +926,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=MODEL_PATH, help="BAGEL model path, visible on both nodes")
     parser.add_argument("--stage0-host", required=True, help="Stage-0 local host identity")
     parser.add_argument("--stage1-host", required=True, help="SSH host name for stage 1")
-    parser.add_argument("--stage0-ip", required=True, help="Stage-0 API and RDMA IP")
-    parser.add_argument("--stage1-ip", required=True, help="Stage-1 RDMA IP")
-    parser.add_argument("--connector", choices=("mooncake", "yuanrong"), default="mooncake")
+    parser.add_argument("--stage0-ip", required=True, help="Stage-0 API and transfer IP")
+    parser.add_argument("--stage1-ip", required=True, help="Stage-1 transfer IP; unused by shared_memory")
+    parser.add_argument(
+        "--connector",
+        choices=("yuanrong", "mooncake", "shared_memory"),
+        default="mooncake",
+        help=(
+            "Stage connector: yuanrong or mooncake for cross-node RDMA; "
+            "shared_memory for a same-node non-RDMA baseline"
+        ),
+    )
     parser.add_argument("--rdma-device", default="", help="Optional RDMA HCA name")
     parser.add_argument(
         "--memory-pool-device",
